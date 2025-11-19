@@ -2,7 +2,7 @@ from google import genai
 from google.genai import types
 import streamlit as st
 import os
-import OpenAI 
+import OpenAI
 
 client = genai.Client()
 
