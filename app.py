@@ -1,8 +1,8 @@
 from google import genai
 from google.genai import types
-import streamlit as st
+import streamlit as st # pyright: ignore[reportMissingImports]
 import os
-import OpenAI
+import OpenAI 
 
 client = genai.Client()
 
