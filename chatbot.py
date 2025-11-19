@@ -1,13 +1,16 @@
 from google import genai
 from google.genai import types
-import streamlit as st # type: ignore
+import streamlit as st
 import os
 import time
 from groq import Groq
 
-client = genai.Client()
+# Initialize Clients
+client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY")) # Ensure API key is passed
 client2 = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
+# Cache this function so it doesn't slow down the chat on every message
+@st.cache_data(ttl=3600) 
 def get_catchy_phrase():
     """Generate a catchy phrase using Groq."""
     try:
@@ -20,9 +23,9 @@ def get_catchy_phrase():
                 {
                     "role": "user",
                     "content": "Generate a catchy phrase to encourage users to interact with a chatbot that helps with anything and roasts them humorously. Dont use any formatting like quotes or special characters and bold. Keep it short and sweet. Return only the phrase.",
-                }
+                },
             ],
-            model="openai/gpt-oss-20b",
+            model="llama3-8b-8192", # Changed to a reliable model on Groq
         )
         return response.choices[0].message.content
     except Exception:
@@ -35,60 +38,79 @@ def initialize_session_state():
 def display_chat_history():
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
-            st.write(message["content"])
+            st.markdown(message["content"]) # Use markdown for better formatting
 
 def stream_data_to_chat(text: str, delay: float = 0.02):
+    """Streams data with a typing effect."""
     placeholder = st.empty()
-    current = ""
-    for word in text.split(" "):
-        current += word + " "
-        placeholder.write(current)
+    full_response = ""
+    
+    # Use .split() without arguments to handle newlines/tabs better
+    # Or strictly just iterate chunks if you want to preserve exact spacing
+    tokens = text.split(" ") 
+    
+    for i, token in enumerate(tokens):
+        full_response += token + " "
+        # Add a blinking cursor effect
+        placeholder.markdown(full_response + "▌")
         time.sleep(delay)
+    
+    # Final write without cursor
+    placeholder.markdown(full_response)
 
 def get_ai_response(user_input: str, system_prompt: str) -> str:
-    response = client.models.generate_content(
-        model="gemini-2.5-flash-lite",
-        config=types.GenerateContentConfig(
-            system_instruction=system_prompt
-        ),
-        contents=[f"User: {user_input}."],
-    )
-    return response.text if response.text else ""
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-lite", # Ensure you use a valid model name
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt
+            ),
+            contents=[user_input], # Simplified content passing
+        )
+        # Handle cases where safety filters block the response
+        if response.text:
+            return response.text
+        else:
+            return "I'm speechless. (Safety filters might have blocked my response)."
+            
+    except Exception as e:
+        return f"Error generating response: {str(e)}"
 
 def display_and_store_response(response_text: str):
     with st.chat_message("assistant"):
-        try:
-            stream_data_to_chat(response_text)
-        except Exception:
-            st.write(response_text)
+        stream_data_to_chat(response_text)
     
     st.session_state.messages.append({"role": "assistant", "content": response_text})
 
 def main():
     st.title("Chat With Me!")
     st.sidebar.info("Talk to me, Sanniva's Digital Twin! I can't help with anything and roast you humorously.")
+    
     initialize_session_state()
     display_chat_history()
     
-    # Get catchy phrase from Groq
+    # Get catchy phrase (Now Cached!)
     catchy_text = get_catchy_phrase()
     
     # Get user input
-    calc = st.chat_input(catchy_text) # type: ignore
-    if calc:
+    if prompt := st.chat_input(catchy_text):
         # Add user message to history
-        st.session_state.messages.append({"role": "user", "content": calc})
+        st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
-            st.write(calc)
+            st.markdown(prompt)
         
         # Get system prompt
-        with open("System_prompt.txt") as f:
-            system_prompt = f.read()
+        try:
+            with open("System_prompt.txt", "r") as f:
+                system_prompt = f.read()
+        except FileNotFoundError:
+            system_prompt = "You are a helpful and humorous assistant."
         
         # Get and display AI response
-        response_text = get_ai_response(calc, system_prompt)
+        with st.spinner("Thinking..."):
+            response_text = get_ai_response(prompt, system_prompt)
+            
         display_and_store_response(response_text)
-
 
 if __name__ == "__main__":
     main()
