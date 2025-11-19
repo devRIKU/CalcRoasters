@@ -4,27 +4,29 @@ import streamlit as st # type: ignore
 import os
 import time
 from groq import Groq
-# import openai
-client2 = Groq(
-    api_key=os.environ.get("GROQ_API_KEY"),
-)
-text = client2.chat.completions.create(
-    messages=[
-        {
-            "role": "system",
-            "content": "You generate cool and concise Phrases to engage users to my Chatbot application.",
-        },
-        {
-            "role": "user",
-            "content": "Generate a catchy phrase to encourage users to interact with a chatbot that helps with anything and roasts them humorously.",
-        }
-    ],
-    model="openai/gpt-oss-20b",
-)
-
 
 client = genai.Client()
-text = "Enter what to calculate: "
+client2 = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+
+def get_catchy_phrase():
+    """Generate a catchy phrase using Groq."""
+    try:
+        response = client2.chat.completions.create(
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You generate cool and concise Phrases to engage users to my Chatbot application.",
+                },
+                {
+                    "role": "user",
+                    "content": "Generate a catchy phrase to encourage users to interact with a chatbot that helps with anything and roasts them humorously. Dont use any formatting like quotes or special characters and bold. Keep it short and sweet. Return only the phrase.",
+                }
+            ],
+            model="openai/gpt-oss-20b",
+        )
+        return response.choices[0].message.content
+    except Exception:
+        return "Enter what to calculate: "
 
 def initialize_session_state():
     if "messages" not in st.session_state:
@@ -64,12 +66,15 @@ def display_and_store_response(response_text: str):
 
 def main():
     st.title("Chat With Me!")
-    
+    st.sidebar.info("Talk to me, Sanniva's Digital Twin! I can't help with anything and roast you humorously.")
     initialize_session_state()
     display_chat_history()
     
+    # Get catchy phrase from Groq
+    catchy_text = get_catchy_phrase()
+    
     # Get user input
-    calc = st.chat_input(text)
+    calc = st.chat_input(catchy_text) # type: ignore
     if calc:
         # Add user message to history
         st.session_state.messages.append({"role": "user", "content": calc})
@@ -83,6 +88,7 @@ def main():
         # Get and display AI response
         response_text = get_ai_response(calc, system_prompt)
         display_and_store_response(response_text)
+
 
 if __name__ == "__main__":
     main()
