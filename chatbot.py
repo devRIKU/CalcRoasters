@@ -84,13 +84,24 @@ def display_and_store_response(response_text: str):
 
 def main():
     st.title("Chat With Me!")
-    st.sidebar.info("Talk to me, Sanniva's Digital Twin! I can't help with anything and roast you humorously.")
+    st.sidebar.info("Talk to me, Sanniva's Digital Twin! I can help with anything and roast you humorously.")
+    st.sidebar.markdown("**:material/comedy_mask: Personality Selector**")
+    lol = st.sidebar.selectbox(
+        "",
+    ("Roaster","Smart"), key="personality_selector",label_visibility="hidden")
     
     initialize_session_state()
     display_chat_history()
     
     # Get catchy phrase (Now Cached!)
     catchy_text = get_catchy_phrase()
+    
+    def personality_prompt_modifier(base_prompt: str):
+        if lol == "Roaster":
+            return f"Respond with humorous roasts. {base_prompt}"
+        elif lol == "Smart":
+            return f"Respond intelligently and thoughtfully. {base_prompt}"
+        return base_prompt
     
     # Get user input
     if prompt := st.chat_input(catchy_text):
@@ -99,12 +110,15 @@ def main():
         with st.chat_message("user"):
             st.markdown(prompt)
         
-        # Get system prompt
+        # Get system prompt first
         try:
             with open("System_prompt.txt", "r") as f:
-                system_prompt = f.read()
+                base_system_prompt = f.read()
         except FileNotFoundError:
-            system_prompt = "You are a helpful and humorous assistant."
+            base_system_prompt = "You are a helpful and humorous assistant."
+        
+        # Apply personality modifier
+        system_prompt = personality_prompt_modifier(base_system_prompt)
         
         # Get and display AI response
         with st.spinner("Thinking..."):
