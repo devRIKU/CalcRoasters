@@ -172,7 +172,7 @@ def build_system_prompt(base_prompt: str, personality: str, brain_type: str) -> 
 def main():
     st.title("Chat With Me!")
     st.sidebar.info("Talk to me, Sanniva's Digital Twin! I can help with anything and roast you humorously.")
-    with st.chat_message("assistant", avatar="sanniva_face.png"):
+    with st.chat_message("assistant", avatar="sanniva_face.jpg"):
         st.write("I'm optimizing my code. What about you?")
     # Personality Selector
     st.sidebar.markdown("**:material/comedy_mask: Personality Selector**")
