@@ -138,7 +138,7 @@ def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str,
 
 def display_and_store_response(response_text: str):
     """Display AI response with streaming effect and store in session."""
-    with st.chat_message("assistant", avatar="sanniva_face.jpg"):
+    with st.chat_message("assistant",avatar="sanniva_face.png"):
         stream_data_to_chat(response_text)
     
     st.session_state.messages.append({"role": "assistant", "content": response_text})
@@ -172,7 +172,7 @@ def build_system_prompt(base_prompt: str, personality: str, brain_type: str) -> 
 def main():
     st.title("Chat With Me!")
     st.sidebar.info("Talk to me, Sanniva's Digital Twin! I can help with anything and roast you humorously.")
-    with st.chat_message("assistant", avatar="sanniva_face.jpg"):
+    with st.chat_message("assistant", avatar="sanniva_face.png"):
         st.write("I'm optimizing my code. What about you?")
     # Personality Selector
     st.sidebar.markdown("**:material/comedy_mask: Personality Selector**")
@@ -209,13 +209,6 @@ def main():
     # Get catchy phrase (cached)
     catchy_text = get_catchy_phrase()
     
-    def personality_prompt_modifier(base_prompt: str):
-        if lol == "Roaster":
-            return f"Respond with humorous roasts. {base_prompt}"
-        elif lol == "Smart":
-            return f"Respond intelligently and thoughtfully. {base_prompt}"
-        return base_prompt
-    
     # Get user input
     if prompt := st.chat_input(catchy_text):
         # Add user message to history
@@ -223,12 +216,9 @@ def main():
         with st.chat_message("user"):
             st.markdown(prompt)
         
-        # Get system prompt
-        try:
-            with open("System_prompt.txt", "r") as f:
-                system_prompt = f.read()
-        except FileNotFoundError:
-            system_prompt = "You are a helpful and humorous assistant."
+        # Load and build system prompt
+        base_system_prompt = load_system_prompt()
+        system_prompt = build_system_prompt(base_system_prompt, personality, brain_type)
         
         # Get and display AI response with conversation context
         with st.spinner("Thinking..." if brain_type == "Thinker" else "Generating response..."):
