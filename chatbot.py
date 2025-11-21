@@ -39,7 +39,7 @@ def initialize_session_state():
 def display_chat_history():
     """Display all messages in the chat history."""
     for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
+        with st.chat_message(message["role"], avatar="sanniva_face.jpg"):
             st.markdown(message["content"])
 
 def stream_data_to_chat(text: str, delay: float = 0.02):
