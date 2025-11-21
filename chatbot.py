@@ -138,7 +138,7 @@ def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str,
 
 def display_and_store_response(response_text: str):
     """Display AI response with streaming effect and store in session."""
-    with st.chat_message("assistant",avatar="sanniva_face.jpg"):
+    with st.chat_message("assistant"):
         stream_data_to_chat(response_text)
     
     st.session_state.messages.append({"role": "assistant", "content": response_text})
