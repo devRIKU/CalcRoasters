@@ -39,7 +39,7 @@ def initialize_session_state():
 def display_chat_history():
     """Display all messages in the chat history."""
     for message in st.session_state.messages:
-        with st.chat_message(message["role"], avatar="sanniva_face.jpg"):
+        with st.chat_message(message["role"],):
             st.markdown(message["content"])
 
 def stream_data_to_chat(text: str, delay: float = 0.02):
@@ -138,7 +138,7 @@ def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str,
 
 def display_and_store_response(response_text: str):
     """Display AI response with streaming effect and store in session."""
-    with st.chat_message("assistant"):
+    with st.chat_message("assistant",avatar="sanniva_face.jpg"):
         stream_data_to_chat(response_text)
     
     st.session_state.messages.append({"role": "assistant", "content": response_text})
