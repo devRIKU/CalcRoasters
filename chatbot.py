@@ -115,7 +115,7 @@ def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str,
             
             # Use Gemini with thinking mode for thoughtful responses
             response = client.models.generate_content(
-                model="gemini-2.0-flash-thinking-exp-1219",
+                model="gemini-2.5-flash",
                 config=types.GenerateContentConfig(
                     system_instruction=system_prompt,
                     thinking_config=types.ThinkingConfig(
