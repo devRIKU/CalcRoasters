@@ -209,6 +209,13 @@ def main():
     # Get catchy phrase (cached)
     catchy_text = get_catchy_phrase()
     
+    def personality_prompt_modifier(base_prompt: str):
+        if lol == "Roaster":
+            return f"Respond with humorous roasts. {base_prompt}"
+        elif lol == "Smart":
+            return f"Respond intelligently and thoughtfully. {base_prompt}"
+        return base_prompt
+    
     # Get user input
     if prompt := st.chat_input(catchy_text):
         # Add user message to history
@@ -216,9 +223,12 @@ def main():
         with st.chat_message("user"):
             st.markdown(prompt)
         
-        # Load and build system prompt
-        base_system_prompt = load_system_prompt()
-        system_prompt = build_system_prompt(base_system_prompt, personality, brain_type)
+        # Get system prompt
+        try:
+            with open("System_prompt.txt", "r") as f:
+                system_prompt = f.read()
+        except FileNotFoundError:
+            system_prompt = "You are a helpful and humorous assistant."
         
         # Get and display AI response with conversation context
         with st.spinner("Thinking..." if brain_type == "Thinker" else "Generating response..."):
