@@ -9,7 +9,6 @@ from groq import Groq
 client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
 client2 = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# Cache this function so it doesn't slow down the chat on every message
 @st.cache_data(ttl=3600) 
 def get_catchy_phrase() -> str:
     """Generate a catchy phrase using Groq."""
@@ -138,7 +137,7 @@ def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str,
 
 def display_and_store_response(response_text: str):
     """Display AI response with streaming effect and store in session."""
-    with st.chat_message("assistant",avatar="sanniva_face.png"):
+    with st.chat_message("assistant",avatar="sanniva_face.jpg"):
         stream_data_to_chat(response_text)
     
     st.session_state.messages.append({"role": "assistant", "content": response_text})
@@ -172,7 +171,7 @@ def build_system_prompt(base_prompt: str, personality: str, brain_type: str) -> 
 def main():
     st.title("Chat With Me!")
     st.sidebar.info("Talk to me, Sanniva's Digital Twin! I can help with anything and roast you humorously.")
-    with st.chat_message("assistant", avatar="sanniva_face.png"):
+    with st.chat_message("assistant", avatar="sanniva_face.jpg"):
         st.write("I'm optimizing my code. What about you?")
     # Personality Selector
     st.sidebar.markdown("**:material/comedy_mask: Personality Selector**")
