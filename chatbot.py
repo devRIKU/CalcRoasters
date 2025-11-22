@@ -172,8 +172,8 @@ def main():
     st.sidebar.info("I am Sanniva's Digital Twin! I can help with anything and roast you humorously.")
     
     # Only show this once using session state logic if you want, but static is fine
-    with st.sidebar:
-        st.image(get_avatar(), width=100) if get_avatar() != "🤖" else st.write("🤖")
+    # with st.sidebar:
+    #     st.image(get_avatar(), width=100) if get_avatar() != "🤖" else st.write("🤖")
     
     # Personality Selector
     st.sidebar.markdown("**:material/comedy_mask: Personality**")
