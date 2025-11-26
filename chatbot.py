@@ -11,22 +11,30 @@ GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 # Initialize Clients with error handling
+client = None
+client2 = None
 try:
     client = genai.Client(api_key=GOOGLE_API_KEY)
     client2 = Groq(api_key=GROQ_API_KEY)
 except Exception as e:
+    # Avoid raising at import time; show message once app runs
     st.error(f"Error initializing API clients: {e}. Check your API Keys!")
 
 # Helper for Avatar
 def get_avatar():
     """Returns image path if exists, else emoji"""
-    if os.path.exists("sanniva_face.jpg"):
-        return "sanniva_face.jpg"
-    return "🤖" # Fallback emoji
+    try:
+        if os.path.exists("sanniva_face.jpg"):
+            return "sanniva_face.jpg"
+    except Exception:
+        pass
+    return "🤖"  # Fallback emoji
 
 @st.cache_data(ttl=3600)
 def get_catchy_phrase() -> str:
     """Generate a catchy phrase using Groq."""
+    if client2 is None:
+        return "Yeah go ahead, ask me anything!"
     try:
         response = client2.chat.completions.create(
             messages=[
@@ -39,9 +47,13 @@ def get_catchy_phrase() -> str:
                     "content": "Generate a catchy phrase to encourage users to interact with a chatbot that helps with anything and roasts them humorously. Dont use any formatting like quotes or special characters and bold. Keep it short and sweet. Return only the phrase.",
                 },
             ],
-            model="llama-3.3-70b-versatile", # Updated to match your main logic
+            model="llama-3.3-70b-versatile",
         )
-        return response.choices[0].message.content or "Yeah go ahead, ask me anything!"
+        # Defensive access
+        try:
+            return response.choices[0].message.content or "Yeah go ahead, ask me anything!"
+        except Exception:
+            return str(response) or "Yeah go ahead, ask me anything!"
     except Exception:
         return "Yeah go ahead, ask me anything!"
 
@@ -52,75 +64,71 @@ def initialize_session_state():
 
 def display_chat_history():
     """Display all messages in the chat history."""
+    if "messages" not in st.session_state:
+        return
     for message in st.session_state.messages:
-        # Check if it's assistant to apply avatar
-        avatar = get_avatar() if message["role"] == "assistant" else None
-        with st.chat_message(message["role"], avatar=avatar):
-            st.markdown(message["content"])
+        avatar = get_avatar() if message.get("role") == "assistant" else None
+        with st.chat_message(message.get("role", "user"), avatar=avatar):
+            st.markdown(message.get("content", ""))
 
 def stream_data_to_chat(text: str, delay: float = 0.02):
     """Streams data with a typing effect."""
     placeholder = st.empty()
     full_response = ""
-    
-    # Split by words to keep it smoother
-    tokens = text.split(" ") 
-    
+    tokens = text.split(" ")
     for token in tokens:
         full_response += token + " "
         placeholder.markdown(full_response + "▌")
         time.sleep(delay)
-    
     placeholder.markdown(full_response)
 
 def load_system_prompt() -> str:
     """Load the base system prompt from file."""
     try:
-        with open("System_prompt.txt", "r") as f:
+        with open("System_prompt.txt", "r", encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
         return "You are a helpful and humorous assistant named Sanniva."
+    except Exception:
+        return "You are a helpful and humorous assistant named Sanniva."
 
-def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str, chat_history: list) -> str:
+def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str, chat_history: list, temperature: float) -> str:
     """Get AI response based on selected brain type."""
     try:
         if brain_type == "Fast":
             # --- GROQ LOGIC ---
+            if client2 is None:
+                return "Groq client not initialized."
             messages = [{"role": "system", "content": system_prompt}]
-            
-            # Add chat history (last 10)
             for msg in chat_history[-10:]:
-                messages.append({
-                    "role": msg["role"],
-                    "content": msg["content"]
-                })
-            
+                messages.append({"role": msg.get("role"), "content": msg.get("content")})
             messages.append({"role": "user", "content": prompt})
-            
             response = client2.chat.completions.create(
-                messages=messages, #type: ignore
+                messages=messages,  # type: ignore
                 model="llama-3.3-70b-versatile"
             )
-            return response.choices[0].message.content or "No response generated."
-            
+            try:
+                return response.choices[0].message.content or "No response generated."
+            except Exception:
+                return str(response) or "No response generated."
+
         elif brain_type == "Thinker":
             # --- GEMINI LOGIC ---
+            if client is None:
+                return "Gemini client not initialized."
             conversation_context = ""
-            
-            # Format history as a string context for Gemini
             for msg in chat_history[-10:]:
-                role_label = "User" if msg["role"] == "user" else "Assistant"
-                conversation_context += f"{role_label}: {msg['content']}\n\n"
-            
+                role_label = "User" if msg.get("role") == "user" else "Assistant"
+                conversation_context += f"{role_label}: {msg.get('content')}\n\n"
             full_prompt = f"{conversation_context}User: {prompt}"
             response = client.models.generate_content(
-                model="gemini-2.5-flash-lite", 
+                model="gemini-2.5-flash-lite",
                 config=types.GenerateContentConfig(
                     system_instruction=system_prompt,
                     thinking_config=types.ThinkingConfig(
                         thinking_budget=8192
                     ),
-                    # Loosen safety for "Roaster" mode to work
+                    temperature=temperature,
                     safety_settings=[
                         types.SafetySetting(
                             category="HARM_CATEGORY_HARASSMENT",
@@ -134,98 +142,113 @@ def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str,
                 ),
                 contents=[full_prompt],
             )
-            
-            if response.text:
+            if getattr(response, "text", None):
                 return response.text
-            else:
+            try:
+                # fallback if response structure differs
+                return str(response)
+            except Exception:
                 return "I'm speechless. (Safety filters might have blocked my response)."
         else:
             return "Invalid brain type selected."
-            
+
     except Exception as e:
         return f"Error generating response: {str(e)}"
 
 def display_and_store_response(response_text: str):
     """Display AI response with streaming effect and store in session."""
+    if response_text is None:
+        response_text = ""
     with st.chat_message("assistant", avatar=get_avatar()):
-        stream_data_to_chat(response_text)
-    
+        try:
+            stream_data_to_chat(response_text)
+        except Exception:
+            st.markdown(response_text)
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
     st.session_state.messages.append({"role": "assistant", "content": response_text})
 
 def build_system_prompt(base_prompt: str, personality: str, brain_type: str) -> str:
-    prompt = base_prompt
-    
+    prompt = base_prompt or ""
     if personality == "Roaster":
         prompt += " You are in ROAST MODE. Be witty, savage, and roast the user humorously based on their input."
     elif personality == "Smart":
         prompt += " Respond intelligently, academically, and thoughtfully."
-    
+    elif personality == "Debater":
+        prompt += " Engage in debates, present multiple viewpoints, and challenge the user's ideas respectfully."
     if brain_type == "Thinker":
         prompt += " Use deep thinking to analyze the request before answering."
-    
     return prompt
 
 def main():
-    st.set_page_config(page_title="Sanniva AI", page_icon="🤖") # Added page config
+    st.set_page_config(page_title="Sanniva AI", page_icon="🤖")
     st.title("Chat With Sanniva!")
-    
     st.sidebar.info("I am Sanniva's Digital Twin! I can help with anything and roast you humorously.")
-    
-    # Only show this once using session state logic if you want, but static is fine
-    # with st.sidebar:
-    #     st.image(get_avatar(), width=100) if get_avatar() != "🤖" else st.write("🤖")
-    
+
     # Personality Selector
-    st.sidebar.markdown("**:material/comedy_mask: Personality**")
+    st.sidebar.markdown("**Personality**")
     personality = st.sidebar.selectbox(
         "Select Personality",
-        ("Roaster", "Smart"),
+        ("Roaster", "Smart", "Debater"),
         key="personality_selector",
         label_visibility="collapsed"
     )
-    
+
     if personality == "Roaster":
         st.sidebar.caption("😂 **Roaster:** Witty & Savage")
     elif personality == "Smart":
         st.sidebar.caption("🧠 **Smart:** Intelligent & Polite")
-    
+    elif personality == "Debater":
+        st.sidebar.caption("🎓 **Debater:** Debates Against Anything")
+
     # Brain Selector
-    st.sidebar.markdown("**:material/psychology: Brain Power**")
+    st.sidebar.markdown("**Brain Power**")
     brain_type = st.sidebar.selectbox(
         "Select Brain",
         ("Fast", "Thinker"),
         key="brain_selector",
         label_visibility="collapsed"
     )
-    
+
     if brain_type == "Fast":
         st.sidebar.caption("⚡ **Fast:** Instant answers (Groq)")
     else:
-        st.sidebar.caption("🕵️ **Thinker:** Deep reasoning (Gemini 2.0 Thinking)")
-    
+        st.sidebar.caption("🕵️ **Thinker:** Deep reasoning (Gemini 2.5 Thinking)")
+
+    if st.sidebar.button("🗑️ Clear Chat"):
+        st.session_state.messages = []
+        st.rerun()
+
+    temperature_val = st.sidebar.slider(
+        "Creativity Level (Chaos)",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.7,
+        step=0.1
+    )
+
     initialize_session_state()
     display_chat_history()
-    
+
     catchy_text = get_catchy_phrase()
-    
+
     if prompt := st.chat_input(catchy_text):
-        # User Message
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
-        
-        # System Prompt & Response
+
         base_system_prompt = load_system_prompt()
         system_prompt = build_system_prompt(base_system_prompt, personality, brain_type)
-        
+
         with st.spinner("Thinking..." if brain_type == "Thinker" else "Generating..."):
             response_text = get_ai_response_with_brain(
-                prompt, 
-                system_prompt, 
-                brain_type, 
-                st.session_state.messages
+                prompt,
+                system_prompt,
+                brain_type,
+                st.session_state.messages,
+                temperature_val
             )
-        
+
         display_and_store_response(response_text)
 
 if __name__ == "__main__":
