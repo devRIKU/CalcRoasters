@@ -61,6 +61,9 @@ def initialize_session_state():
     """Initialize session state variables."""
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    # default personality selector value
+    if "personality_selector" not in st.session_state:
+        st.session_state.personality_selector = "Roaster"
 
 def display_chat_history():
     """Display all messages in the chat history."""
@@ -122,7 +125,7 @@ def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str,
                 conversation_context += f"{role_label}: {msg.get('content')}\n\n"
             full_prompt = f"{conversation_context}User: {prompt}"
             response = client.models.generate_content(
-                model="gemini-2.5-flash-lite",
+                model="gemini-2.5-flash",
                 config=types.GenerateContentConfig(
                     system_instruction=system_prompt,
                     thinking_config=types.ThinkingConfig(
@@ -171,27 +174,35 @@ def display_and_store_response(response_text: str):
 def build_system_prompt(base_prompt: str, personality: str, brain_type: str) -> str:
     prompt = base_prompt or ""
     if personality == "Roaster":
-        prompt += " You are in ROAST MODE. Be witty, savage, and roast the user humorously based on their input."
+        prompt += " You are in ROAST MODE. Be savage, and roast the user humorously based on their input. Have Fun and no mercy"
     elif personality == "Smart":
-        prompt += " Respond intelligently, academically, and thoughtfully."
+        prompt += "Respond intelligently, academically, and thoughtfully."
     elif personality == "Debater":
         prompt += " Engage in debates, present multiple viewpoints, and challenge the user's ideas respectfully."
+    elif personality == "Strategic":
+        prompt += "Strategize your responses to provide the most effective and efficient solutions."
     if brain_type == "Thinker":
         prompt += " Use deep thinking to analyze the request before answering."
     return prompt
+
+
+# Auto-personality detection removed — personality is now always manual via the sidebar selectbox
 
 def main():
     st.set_page_config(page_title="Sanniva AI", page_icon="🤖")
     st.title("Chat With Sanniva!")
     st.sidebar.info("I am Sanniva's Digital Twin! I can help with anything and roast you humorously.")
 
-    # Personality Selector
+    # Initialize session state early so detection and UI stay in sync
+    initialize_session_state()
+
+    # Personality selector (manual only)
     st.sidebar.markdown("**Personality**")
     personality = st.sidebar.selectbox(
         "Select Personality",
-        ("Roaster", "Smart", "Debater"),
+        ("Roaster", "Smart", "Debater", "Strategic"),
         key="personality_selector",
-        label_visibility="collapsed"
+        label_visibility="collapsed",
     )
 
     if personality == "Roaster":
@@ -227,8 +238,9 @@ def main():
         step=0.1
     )
 
-    initialize_session_state()
     display_chat_history()
+
+    # (No auto-personality) — personality comes from the sidebar selectbox
 
     catchy_text = get_catchy_phrase()
 
