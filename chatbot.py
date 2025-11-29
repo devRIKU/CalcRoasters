@@ -47,7 +47,7 @@ def get_catchy_phrase() -> str:
                     "content": "Generate a catchy phrase to encourage users to interact with a chatbot that helps with anything and roasts them humorously. Dont use any formatting like quotes or special characters and bold. Keep it short and sweet. Return only the phrase.",
                 },
             ],
-            model="llama-3.3-70b-versatile",
+            model="mixtral-8x7b-32768",
         )
         # Defensive access
         try:
@@ -64,14 +64,17 @@ def initialize_session_state():
     # default personality selector value
     if "personality_selector" not in st.session_state:
         st.session_state.personality_selector = "Roaster"
+    if "greeting_shown" not in st.session_state:
+        st.session_state.greeting_shown = False
 
 def display_chat_history():
     """Display all messages in the chat history."""
     if "messages" not in st.session_state:
         return
     for message in st.session_state.messages:
-        avatar = get_avatar() if message.get("role") == "assistant" else None
-        with st.chat_message(message.get("role", "user"), avatar=avatar):
+        role = message.get("role", "user")
+        avatar = get_avatar() if role == "assistant" else None
+        with st.chat_message(role, avatar=avatar):
             st.markdown(message.get("content", ""))
 
 def stream_data_to_chat(text: str, delay: float = 0.02):
@@ -205,12 +208,18 @@ def main():
         label_visibility="collapsed",
     )
 
+    # Apply Theme based on Personality (updates config.toml)
+    from styles import apply_theme
+    apply_theme(personality)
+
     if personality == "Roaster":
         st.sidebar.caption("😂 **Roaster:** Witty & Savage")
     elif personality == "Smart":
         st.sidebar.caption("🧠 **Smart:** Intelligent & Polite")
     elif personality == "Debater":
         st.sidebar.caption("🎓 **Debater:** Debates Against Anything")
+    elif personality == "Strategic":
+        st.sidebar.caption("♟️ **Strategic:** Efficient & Calculated")
 
     # Brain Selector
     st.sidebar.markdown("**Brain Power**")
@@ -239,6 +248,25 @@ def main():
     )
 
     display_chat_history()
+
+    # Initial Greeting with Typewriter Effect
+    if not st.session_state.greeting_shown:
+        if personality == "Roaster":
+            greeting_text = "Oh look, another human. I'm Sanniva. Try not to bore me."
+        elif personality == "Smart":
+            greeting_text = "Greetings. I am Sanniva. How may I assist you with your intellectual endeavors today?"
+        elif personality == "Debater":
+            greeting_text = "I'm Sanniva. I'm ready to challenge your views. Bring it on."
+        elif personality == "Strategic":
+            greeting_text = "Sanniva online. Systems operational. Ready to optimize your workflow."
+        else:
+            greeting_text = "Hello! I'm Sanniva."
+
+        with st.chat_message("assistant", avatar=get_avatar()):
+            stream_data_to_chat(greeting_text)
+        
+        st.session_state.messages.append({"role": "assistant", "content": greeting_text})
+        st.session_state.greeting_shown = True
 
     # (No auto-personality) — personality comes from the sidebar selectbox
 
