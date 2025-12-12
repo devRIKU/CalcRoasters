@@ -4,6 +4,8 @@ import streamlit as st
 import os
 import time
 from groq import Groq
+from streamlit.runtime.scriptrunner import get_script_run_ctx
+from user_agents import parse  # You will need to install this!
 
 # --- CONFIGURATION ---
 # Make sure these are set in your environment or Streamlit Secrets!
@@ -20,6 +22,38 @@ except Exception as e:
     # Avoid raising at import time; show message once app runs
     st.error(f"Error initializing API clients: {e}. Check your API Keys!")
 
+
+def get_user_agent_string():
+    """Gets the raw User-Agent string from the current session's headers."""
+    try:
+        # Get the current session context
+        ctx = get_script_run_ctx()
+        if ctx is None:
+            return "Could not get session context."
+        
+        # Access the headers from the session's request
+        # Note: This uses Streamlit's internal runtime, which is generally discouraged, 
+        # but it's the most reliable way to get headers right now.
+        headers = st.runtime.get_instance().get_client(ctx.session_id).request.headers
+        
+        # The User-Agent is the specific header we want
+        user_agent_string = headers.get("User-Agent", "User-Agent Not Found")
+        return user_agent_string
+        
+    except Exception as e:
+        return f"Error retrieving User-Agent: {e}"
+
+# --- Function to parse the OS from the User-Agent string ---
+def get_os_from_user_agent(user_agent_string):
+    """Uses the 'user-agents' library to parse OS info."""
+    if not user_agent_string or "Not Found" in user_agent_string or "Error" in user_agent_string:
+        return "Unknown OS"
+    
+    # Use the parsing library
+    user_agent = parse(user_agent_string)
+    
+    # Get the OS information (e.g., 'Windows', 'Mac OS X', 'Android')
+    return user_agent.os.family
 # Helper for Avatar
 def get_avatar():
     """Returns image path if exists, else emoji"""
@@ -290,6 +324,16 @@ def main():
             )
 
         display_and_store_response(response_text)
+raw_ua = get_user_agent_string()
 
+# Parse the OS
+user_os = get_os_from_user_agent(raw_ua)
+
+if user_os.lower() == "windows":
+    st.sidebar.success("Hi Windows User! Arent you glad giving all your data to Microsoft?")
+if user_os.lower() == "mac os x":
+    st.sidebar.success("Hey Mac User! Hope you arent using Safari!")
+if user_os.lower() == "android":
+    st.sidebar.success("Hello Android User! Enjoying the freedom of choice?")
 if __name__ == "__main__":
     main()
