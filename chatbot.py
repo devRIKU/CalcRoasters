@@ -3,24 +3,57 @@ from google.genai import types
 import streamlit as st
 import os
 import time
+import sys
+import tempfile
 from groq import Groq
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 from user_agents import parse  # You will need to install this!
+from io import BytesIO
 
 # --- CONFIGURATION ---
 # Make sure these are set in your environment or Streamlit Secrets!
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
+# --- ELEVENLABS CONFIGURATION ---
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
+ELEVENLABS_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"  # Sanniva's voice
+ELEVENLABS_MODEL_ID = "eleven_multilingual_v2"
+
 # Initialize Clients with error handling
 client = None
 client2 = None
+elevenlabs_client = None
 try:
     client = genai.Client(api_key=GOOGLE_API_KEY)
     client2 = Groq(api_key=GROQ_API_KEY)
 except Exception as e:
     # Avoid raising at import time; show message once app runs
-    st.error(f"Error initializing API clients: {e}. Check your API Keys!")
+    try:
+        st.error(f"Error initializing API clients: {e}. Check your API Keys!")
+    except Exception:
+        pass
+
+# Initialize ElevenLabs client
+try:
+    from elevenlabs import ElevenLabs as _ElevenLabs
+    if ELEVENLABS_API_KEY:
+        elevenlabs_client = _ElevenLabs(api_key=ELEVENLABS_API_KEY)
+except Exception:
+    try:
+        from elevenlabs.client import ElevenLabs as _ElevenLabs
+        if ELEVENLABS_API_KEY:
+            elevenlabs_client = _ElevenLabs(api_key=ELEVENLABS_API_KEY)
+    except Exception:
+        pass
+
+# Optional gTTS fallback (free)
+gtts_available = False
+try:
+    from gtts import gTTS  # type: ignore
+    gtts_available = True
+except Exception:
+    gtts_available = False
 
 
 def get_user_agent_string():
@@ -34,7 +67,10 @@ def get_user_agent_string():
         # Access the headers from the session's request
         # Note: This uses Streamlit's internal runtime, which is generally discouraged, 
         # but it's the most reliable way to get headers right now.
-        headers = st.runtime.get_instance().get_client(ctx.session_id).request.headers
+        try:
+            headers = st.runtime.get_instance().get_client(ctx.session_id).request.headers
+        except Exception:
+            return "Could not get headers from session."
         
         # The User-Agent is the specific header we want
         user_agent_string = headers.get("User-Agent", "User-Agent Not Found")
@@ -43,17 +79,86 @@ def get_user_agent_string():
     except Exception as e:
         return f"Error retrieving User-Agent: {e}"
 
+
+def generate_speech(text: str, voice_id: str = ELEVENLABS_VOICE_ID) -> bytes | None:
+    """Generate speech audio bytes from text using ElevenLabs. Returns None on error."""
+    if not elevenlabs_client or not text or not text.strip():
+        return None
+    try:
+        tts = elevenlabs_client.text_to_speech
+        if hasattr(tts, "convert"):
+            resp = tts.convert(text=text, voice_id=voice_id, model_id=ELEVENLABS_MODEL_ID, output_format="mp3_44100_128")
+        else:
+            resp = tts.convert_as_stream(text=text, voice_id=voice_id, model_id=ELEVENLABS_MODEL_ID, output_format="mp3_44100_128")
+        # Extract bytes from response
+        if isinstance(resp, (bytes, bytearray)):
+            return bytes(resp)
+        if hasattr(resp, "read"):
+            return resp.read()
+        if hasattr(resp, "content"):
+            if isinstance(resp.content, (bytes, bytearray)):
+                return bytes(resp.content)
+        return None
+    except Exception:
+        return None
+
+
+def generate_speech_any(text: str, engine: str = "elevenlabs", voice_id: str | None = None, gtts_lang: str = "en") -> bytes | None:
+    """Generate speech using the selected engine. Falls back to gTTS if selected."""
+    if not text or not text.strip():
+        return None
+    try:
+        if engine == "elevenlabs" and elevenlabs_client:
+            return generate_speech(text, voice_id=voice_id or ELEVENLABS_VOICE_ID)
+
+        if engine == "gtts" and gtts_available:
+            bio = BytesIO()
+            t = gTTS(text=text, lang=gtts_lang)
+            t.write_to_fp(bio)
+            bio.seek(0)
+            return bio.read()
+
+        # Engine not available or unsupported
+        return None
+    except Exception:
+        return None
+
+
+def play_audio_bytes(audio_bytes: bytes):
+    """Play audio bytes using the default player on the system."""
+    if not audio_bytes:
+        return
+    try:
+        # Save to temp file
+        f = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+        f.write(audio_bytes)
+        f.flush()
+        f.close()
+        # Open with OS default player
+        if sys.platform.startswith("win"):
+            os.startfile(f.name)  # type: ignore
+        elif sys.platform == "darwin":
+            os.system(f"open {f.name}")
+        else:
+            os.system(f"xdg-open {f.name}")
+    except Exception:
+        pass
+
 # --- Function to parse the OS from the User-Agent string ---
 def get_os_from_user_agent(user_agent_string):
     """Uses the 'user-agents' library to parse OS info."""
-    if not user_agent_string or "Not Found" in user_agent_string or "Error" in user_agent_string:
+    if not user_agent_string or "Not Found" in user_agent_string or "Error" in user_agent_string \
+       or "Could not get session context." in user_agent_string or "Could not get headers" in user_agent_string:
         return "Unknown OS"
     
     # Use the parsing library
-    user_agent = parse(user_agent_string)
-    
-    # Get the OS information (e.g., 'Windows', 'Mac OS X', 'Android')
-    return user_agent.os.family
+    try:
+        user_agent = parse(user_agent_string)
+        # Get the OS information (e.g., 'Windows', 'Mac OS X', 'Android')
+        return user_agent.os.family or "Unknown OS"
+    except Exception:
+        return "Unknown OS"
+
 # Helper for Avatar
 def get_avatar():
     """Returns image path if exists, else emoji"""
@@ -281,6 +386,67 @@ def main():
         step=0.1
     )
 
+    # --- ElevenLabs Voice Selector ---
+    st.sidebar.markdown("**Voice (ElevenLabs)**")
+    selected_voice_id = ELEVENLABS_VOICE_ID
+    voice_options = {}
+    if elevenlabs_client:
+        try:
+            voices_resp = None
+            # Try common SDK access patterns
+            if hasattr(elevenlabs_client, "voices"):
+                vobj = elevenlabs_client.voices
+                if hasattr(vobj, "list"):
+                    voices_resp = vobj.list()
+                elif hasattr(vobj, "list_voices"):
+                    voices_resp = vobj.list_voices()
+                elif hasattr(vobj, "get_all"):
+                    voices_resp = vobj.get_all()
+            elif hasattr(elevenlabs_client, "list_voices"):
+                voices_resp = elevenlabs_client.list_voices()
+
+            voices_list = []
+            if voices_resp:
+                if isinstance(voices_resp, dict) and voices_resp.get("voices"):
+                    voices_list = voices_resp["voices"]
+                elif isinstance(voices_resp, (list, tuple)):
+                    voices_list = voices_resp
+                else:
+                    try:
+                        voices_list = voices_resp.voices
+                    except Exception:
+                        voices_list = []
+
+            for v in voices_list:
+                try:
+                    vid = v.get("id") if isinstance(v, dict) else getattr(v, "id", None)
+                    vname = v.get("name") if isinstance(v, dict) else getattr(v, "name", None)
+                    if vid and vname:
+                        voice_options[vname] = vid
+                except Exception:
+                    continue
+        except Exception:
+            voice_options = {}
+
+    if voice_options:
+        selected_voice_name = st.sidebar.selectbox("Select Voice", options=list(voice_options.keys()))
+        selected_voice_id = voice_options[selected_voice_name]
+    else:
+        selected_voice_id = st.sidebar.text_input("ElevenLabs Voice ID", value=ELEVENLABS_VOICE_ID)
+    # TTS Engine selector (supports ElevenLabs and free gTTS fallback)
+    st.sidebar.markdown("**TTS Engine**")
+    engine_options = ["ElevenLabs"]
+    if gtts_available:
+        engine_options.append("gTTS (Free)")
+    selected_engine = st.sidebar.selectbox("TTS Engine", options=engine_options)
+
+    # If gTTS selected, show language selector
+    selected_gtts_lang = "en"
+    if selected_engine.startswith("gTTS"):
+        # Use gTTS-supported language codes (keep GB -> en to be safe)
+        lang_options = {"English (US)": "en", "English (GB)": "en", "Spanish": "es", "French": "fr", "German": "de"}
+        selected_lang_label = st.sidebar.selectbox("gTTS Language", options=list(lang_options.keys()))
+        selected_gtts_lang = lang_options[selected_lang_label]
     display_chat_history()
 
     # Initial Greeting with Typewriter Effect
@@ -301,6 +467,22 @@ def main():
         
         st.session_state.messages.append({"role": "assistant", "content": greeting_text})
         st.session_state.greeting_shown = True
+
+    # Retrieve user agent and OS info now that Streamlit context exists
+    raw_ua = get_user_agent_string()
+    user_os = get_os_from_user_agent(raw_ua)
+    user_os_lower = (user_os or "").lower()
+
+    # Show OS-specific sidebar messages safely
+    try:
+        if user_os_lower == "windows":
+            st.sidebar.success("Hi Windows User! Arent you glad giving all your data to Microsoft?")
+        elif user_os_lower in ("mac os x", "macos", "mac os"):
+            st.sidebar.success("Hey Mac User! Enjoying the walled garden? Hope you like paying for wheels!")
+        elif user_os_lower == "android":
+            st.sidebar.success("Hello Android User! Enjoying the freedom of choice? Or is Google still tracking you?")
+    except Exception:
+        pass
 
     # (No auto-personality) — personality comes from the sidebar selectbox
 
@@ -324,16 +506,43 @@ def main():
             )
 
         display_and_store_response(response_text)
-raw_ua = get_user_agent_string()
 
-# Parse the OS
-user_os = get_os_from_user_agent(raw_ua)
+        # Add a "Speak" button to read the response aloud
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("🔊 Speak Response"):
+                with st.spinner("Generating speech..."):
+                    engine_key = "elevenlabs" if selected_engine.startswith("ElevenLabs") else "gtts"
+                    audio_bytes = generate_speech_any(response_text, engine=engine_key, voice_id=selected_voice_id, gtts_lang=selected_gtts_lang)
+                    if audio_bytes:
+                        # Show audio player in the page
+                        st.audio(audio_bytes, format="audio/mp3")
 
-if user_os.lower() == "windows":
-    st.sidebar.success("Hi Windows User! Arent you glad giving all your data to Microsoft?")
-if user_os.lower() == "mac os x":
-    st.sidebar.success("Hey Mac User! Hope you arent using Safari!")
-if user_os.lower() == "android":
-    st.sidebar.success("Hello Android User! Enjoying the freedom of choice?")
+                        # Show diagnostics so user can tell if bytes were produced
+                        try:
+                            st.success(f"Generated audio: {len(audio_bytes)} bytes")
+                        except Exception:
+                            pass
+
+                        # Offer download button so user can play locally if browser blocks autoplay
+                        try:
+                            st.download_button("Download audio", data=audio_bytes, file_name="sanniva_response.mp3", mime="audio/mpeg")
+                        except Exception:
+                            pass
+
+                        # Optional: open local player on the server (only useful when running locally)
+                        if st.checkbox("Open local player (server)"):
+                            try:
+                                play_audio_bytes(audio_bytes)
+                            except Exception:
+                                st.warning("Failed to open local player.")
+                    else:
+                        st.warning("Could not generate speech. Check TTS engine availability and configuration.")
+                        # Diagnostic info
+                        try:
+                            st.info(f"Selected engine: {selected_engine}; gTTS available: {gtts_available}; ElevenLabs client present: {bool(elevenlabs_client)}")
+                        except Exception:
+                            pass
+
 if __name__ == "__main__":
     main()
