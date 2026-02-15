@@ -9,21 +9,22 @@ from groq import Groq
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 from user_agents import parse  # You will need to install this!
 from io import BytesIO
+import requests
+import base64
 
 # --- CONFIGURATION ---
 # Make sure these are set in your environment or Streamlit Secrets!
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
-# --- ELEVENLABS CONFIGURATION ---
-ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
-ELEVENLABS_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"  # Sanniva's voice
-ELEVENLABS_MODEL_ID = "eleven_multilingual_v2"
+# --- TTS SERVICE API KEYS ---
+SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY")
+FISH_AUDIO_API_KEY = os.environ.get("FISH_AUDIO_API_KEY")
+SILICON_FLOW_API_KEY = os.environ.get("SILICON_FLOW_API_KEY")
 
 # Initialize Clients with error handling
 client = None
 client2 = None
-elevenlabs_client = None
 try:
     client = genai.Client(api_key=GOOGLE_API_KEY)
     client2 = Groq(api_key=GROQ_API_KEY)
@@ -31,19 +32,6 @@ except Exception as e:
     # Avoid raising at import time; show message once app runs
     try:
         st.error(f"Error initializing API clients: {e}. Check your API Keys!")
-    except Exception:
-        pass
-
-# Initialize ElevenLabs client
-try:
-    from elevenlabs import ElevenLabs as _ElevenLabs
-    if ELEVENLABS_API_KEY:
-        elevenlabs_client = _ElevenLabs(api_key=ELEVENLABS_API_KEY)
-except Exception:
-    try:
-        from elevenlabs.client import ElevenLabs as _ElevenLabs
-        if ELEVENLABS_API_KEY:
-            elevenlabs_client = _ElevenLabs(api_key=ELEVENLABS_API_KEY)
     except Exception:
         pass
 
@@ -85,40 +73,94 @@ def get_user_agent_string():
         return f"Error retrieving User-Agent: {e}"
 
 
-def generate_speech(text: str, voice_id: str = ELEVENLABS_VOICE_ID) -> bytes | None:
-    """Generate speech audio bytes from text using ElevenLabs. Returns None on error."""
-    if not elevenlabs_client or not text or not text.strip():
+def generate_speech_sarvam(text: str, speaker: str = "Shubh", lang: str = "en-IN") -> bytes | None:
+    """Generate speech using Sarvam.ai TTS. Returns MP3 bytes or None on error."""
+    if not SARVAM_API_KEY or not text or not text.strip():
         return None
     try:
-        tts = elevenlabs_client.text_to_speech
-        if hasattr(tts, "convert"):
-            resp = tts.convert(text=text, voice_id=voice_id, model_id=ELEVENLABS_MODEL_ID, output_format="mp3_44100_128")
-        else:
-            resp = tts.convert_as_stream(text=text, voice_id=voice_id, model_id=ELEVENLABS_MODEL_ID, output_format="mp3_44100_128")
-        # Extract bytes from response
-        if isinstance(resp, (bytes, bytearray)):
-            return bytes(resp)
-        if hasattr(resp, "read"):
-            return resp.read()
-        if hasattr(resp, "content"):
-            if isinstance(resp.content, (bytes, bytearray)):
-                return bytes(resp.content)
+        url = "https://api.sarvam.ai/text-to-speech"
+        headers = {
+            "api-subscription-key": SARVAM_API_KEY,
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "text": text,
+            "target_language_code": lang,
+            "speaker": speaker,
+            "model": "bulbul:v3"
+        }
+        resp = requests.post(url, json=payload, headers=headers, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            if "audios" in data and len(data["audios"]) > 0:
+                audio_b64 = data["audios"][0]
+                return base64.b64decode(audio_b64)
         return None
     except Exception:
         return None
 
 
-def generate_speech_any(text: str, engine: str = "elevenlabs", voice_id: str | None = None, gtts_lang: str = "en") -> bytes | None:
+def generate_speech_fish_audio(text: str, voice_id: str = "default", lang: str = "en") -> bytes | None:
+    """Generate speech using Fish Audio TTS. Returns MP3 bytes or None on error."""
+    if not FISH_AUDIO_API_KEY or not text or not text.strip():
+        return None
+    try:
+        url = "https://api.fish.audio/v1/tts"
+        headers = {
+            "Authorization": f"Bearer {FISH_AUDIO_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "text": text,
+            "voice_id": voice_id,
+            "language": lang
+        }
+        resp = requests.post(url, json=payload, headers=headers, timeout=30)
+        if resp.status_code == 200:
+            return resp.content
+        return None
+    except Exception:
+        return None
+
+
+def generate_speech_silicon_flow(text: str, model: str = "tts-default", voice: str = "default") -> bytes | None:
+    """Generate speech using SiliconFlow TTS. Returns MP3 bytes or None on error."""
+    if not SILICON_FLOW_API_KEY or not text or not text.strip():
+        return None
+    try:
+        url = "https://api.siliconflow.cn/v1/audio/speech"
+        headers = {
+            "Authorization": f"Bearer {SILICON_FLOW_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "input": text,
+            "model": model,
+            "voice": voice,
+            "response_format": "mp3"
+        }
+        resp = requests.post(url, json=payload, headers=headers, timeout=30)
+        if resp.status_code == 200:
+            return resp.content
+        return None
+    except Exception:
+        return None
+
+
+def generate_speech_any(text: str, engine: str = "sarvam", speaker_or_voice: str = "Shubh", lang: str = "en") -> bytes | None:
     """Generate speech using the selected engine. Falls back to gTTS if selected."""
     if not text or not text.strip():
         return None
     try:
-        if engine == "elevenlabs" and elevenlabs_client:
-            return generate_speech(text, voice_id=voice_id or ELEVENLABS_VOICE_ID)
-
-        if engine == "gtts" and gtts_available:
+        if engine == "sarvam":
+            return generate_speech_sarvam(text, speaker=speaker_or_voice, lang=lang)
+        elif engine == "fish_audio":
+            return generate_speech_fish_audio(text, voice_id=speaker_or_voice, lang=lang)
+        elif engine == "silicon_flow":
+            return generate_speech_silicon_flow(text, voice=speaker_or_voice)
+        elif engine == "gtts" and gtts_available:
             bio = BytesIO()
-            t = gTTS(text=text, lang=gtts_lang)
+            t = gTTS(text=text, lang=lang)
             t.write_to_fp(bio)
             bio.seek(0)
             return bio.read()
@@ -392,67 +434,52 @@ def main():
         step=0.1
     )
 
-    # --- ElevenLabs Voice Selector ---
-    st.sidebar.markdown("**Voice (ElevenLabs)**")
-    selected_voice_id = ELEVENLABS_VOICE_ID
-    voice_options = {}
-    if elevenlabs_client:
-        try:
-            voices_resp = None
-            # Try common SDK access patterns
-            if hasattr(elevenlabs_client, "voices"):
-                vobj = elevenlabs_client.voices
-                if hasattr(vobj, "list"):
-                    voices_resp = vobj.list()
-                elif hasattr(vobj, "list_voices"):
-                    voices_resp = vobj.list_voices()
-                elif hasattr(vobj, "get_all"):
-                    voices_resp = vobj.get_all()
-            elif hasattr(elevenlabs_client, "list_voices"):
-                voices_resp = elevenlabs_client.list_voices()
-
-            voices_list = []
-            if voices_resp:
-                if isinstance(voices_resp, dict) and voices_resp.get("voices"):
-                    voices_list = voices_resp["voices"]
-                elif isinstance(voices_resp, (list, tuple)):
-                    voices_list = voices_resp
-                else:
-                    try:
-                        voices_list = voices_resp.voices
-                    except Exception:
-                        voices_list = []
-
-            for v in voices_list:
-                try:
-                    vid = v.get("id") if isinstance(v, dict) else getattr(v, "id", None)
-                    vname = v.get("name") if isinstance(v, dict) else getattr(v, "name", None)
-                    if vid and vname:
-                        voice_options[vname] = vid
-                except Exception:
-                    continue
-        except Exception:
-            voice_options = {}
-
-    if voice_options:
-        selected_voice_name = st.sidebar.selectbox("Select Voice", options=list(voice_options.keys()))
-        selected_voice_id = voice_options[selected_voice_name]
-    else:
-        selected_voice_id = st.sidebar.text_input("ElevenLabs Voice ID", value=ELEVENLABS_VOICE_ID)
-    # TTS Engine selector (supports ElevenLabs and free gTTS fallback)
+    # --- TTS Engine & Voice Selector ---
     st.sidebar.markdown("**TTS Engine**")
-    engine_options = ["ElevenLabs"]
+    engine_options = []
+    if SARVAM_API_KEY:
+        engine_options.append("Sarvam.ai")
+    if FISH_AUDIO_API_KEY:
+        engine_options.append("Fish Audio")
+    if SILICON_FLOW_API_KEY:
+        engine_options.append("SiliconFlow")
     if gtts_available:
         engine_options.append("gTTS (Free)")
-    selected_engine = st.sidebar.selectbox("TTS Engine", options=engine_options)
+    
+    if not engine_options:
+        st.sidebar.warning("No TTS engines configured. Add API keys to .env file.")
+        selected_engine = "gTTS (Free)"
+    else:
+        selected_engine = st.sidebar.selectbox("Select TTS Engine", options=engine_options)
 
-    # If gTTS selected, show language selector
-    selected_gtts_lang = "en"
-    if selected_engine.startswith("gTTS"):
-        # Use gTTS-supported language codes (keep GB -> en to be safe)
-        lang_options = {"English (US)": "en", "English (GB)": "en", "Spanish": "es", "French": "fr", "German": "de"}
-        selected_lang_label = st.sidebar.selectbox("gTTS Language", options=list(lang_options.keys()))
-        selected_gtts_lang = lang_options[selected_lang_label]
+    # Voice/Speaker selector based on engine
+    selected_voice = "default"
+    selected_lang = "en"
+    
+    if selected_engine == "Sarvam.ai":
+        st.sidebar.markdown("**Sarvam Speaker**")
+        sarvam_speakers = ["Shubh", "Aditya", "Ritu", "Priya", "Neha", "Rahul", "Pooja", "Rohan", "Simran", "Kavya"]
+        selected_voice = st.sidebar.selectbox("Select Speaker", options=sarvam_speakers)
+        sarvam_langs = {"English (India)": "en-IN", "Hindi": "hi-IN", "Tamil": "ta-IN", "Telugu": "te-IN"}
+        selected_lang = st.sidebar.selectbox("Language", options=list(sarvam_langs.values()), format_func=lambda x: [k for k, v in sarvam_langs.items() if v == x][0])
+    
+    elif selected_engine == "Fish Audio":
+        st.sidebar.markdown("**Fish Audio Voice**")
+        fish_voices = ["default", "e_girl", "young_boy", "mature_female", "male"]
+        selected_voice = st.sidebar.selectbox("Select Voice", options=fish_voices)
+        fish_langs = {"English": "en", "Chinese": "zh", "Spanish": "es", "French": "fr"}
+        selected_lang = st.sidebar.selectbox("Language", options=list(fish_langs.values()), format_func=lambda x: [k for k, v in fish_langs.items() if v == x][0])
+    
+    elif selected_engine == "SiliconFlow":
+        st.sidebar.markdown("**SiliconFlow Voice**")
+        sf_voices = ["default", "narrator_en", "narrator_zh", "casual_en", "casual_zh"]
+        selected_voice = st.sidebar.selectbox("Select Voice", options=sf_voices)
+        selected_lang = "en"
+    
+    elif selected_engine == "gTTS (Free)":
+        st.sidebar.markdown("**gTTS Language**")
+        gtts_langs = {"English": "en", "Spanish": "es", "French": "fr", "German": "de", "Chinese": "zh"}
+        selected_lang = st.sidebar.selectbox("Language", options=list(gtts_langs.values()), format_func=lambda x: [k for k, v in gtts_langs.items() if v == x][0])
     display_chat_history()
 
     # Initial Greeting with Typewriter Effect
@@ -518,8 +545,16 @@ def main():
         with col1:
             if st.button("🔊 Speak Response"):
                 with st.spinner("Generating speech..."):
-                    engine_key = "elevenlabs" if selected_engine.startswith("ElevenLabs") else "gtts"
-                    audio_bytes = generate_speech_any(response_text, engine=engine_key, voice_id=selected_voice_id, gtts_lang=selected_gtts_lang)
+                    # Map engine name to engine key
+                    engine_map = {
+                        "Sarvam.ai": "sarvam",
+                        "Fish Audio": "fish_audio",
+                        "SiliconFlow": "silicon_flow",
+                        "gTTS (Free)": "gtts"
+                    }
+                    engine_key = engine_map.get(selected_engine, "gtts")
+                    
+                    audio_bytes = generate_speech_any(response_text, engine=engine_key, speaker_or_voice=selected_voice, lang=selected_lang)
                     if audio_bytes:
                         # Show audio player in the page
                         st.audio(audio_bytes, format="audio/mp3")
@@ -543,10 +578,10 @@ def main():
                             except Exception:
                                 st.warning("Failed to open local player.")
                     else:
-                        st.warning("Could not generate speech. Check TTS engine availability and configuration.")
+                        st.warning("Could not generate speech. Check TTS engine API key and configuration.")
                         # Diagnostic info
                         try:
-                            st.info(f"Selected engine: {selected_engine}; gTTS available: {gtts_available}; ElevenLabs client present: {bool(elevenlabs_client)}")
+                            st.info(f"Selected engine: {selected_engine} (key: {engine_key})")
                         except Exception:
                             pass
 
