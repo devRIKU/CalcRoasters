@@ -8,7 +8,6 @@ import tempfile
 from groq import Groq
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 from user_agents import parse  # You will need to install this!
-from io import BytesIO
 import requests
 import base64
 
@@ -17,7 +16,7 @@ import base64
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
-# --- TTS SERVICE API KEYS ---
+# TTS SERVICE API KEYS ---
 SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY")
 FISH_AUDIO_API_KEY = os.environ.get("FISH_AUDIO_API_KEY")
 SILICON_FLOW_API_KEY = os.environ.get("SILICON_FLOW_API_KEY")
@@ -34,14 +33,6 @@ except Exception as e:
         st.error(f"Error initializing API clients: {e}. Check your API Keys!")
     except Exception:
         pass
-
-# Optional gTTS fallback (free)
-gtts_available = False
-try:
-    from gtts import gTTS  # type: ignore
-    gtts_available = True
-except Exception:
-    gtts_available = False
 
 
 def get_user_agent_string():
@@ -148,7 +139,7 @@ def generate_speech_silicon_flow(text: str, model: str = "tts-default", voice: s
 
 
 def generate_speech_any(text: str, engine: str = "sarvam", speaker_or_voice: str = "Shubh", lang: str = "en") -> bytes | None:
-    """Generate speech using the selected engine. Falls back to gTTS if selected."""
+    """Generate speech using the selected engine."""
     if not text or not text.strip():
         return None
     try:
@@ -158,12 +149,6 @@ def generate_speech_any(text: str, engine: str = "sarvam", speaker_or_voice: str
             return generate_speech_fish_audio(text, voice_id=speaker_or_voice, lang=lang)
         elif engine == "silicon_flow":
             return generate_speech_silicon_flow(text, voice=speaker_or_voice)
-        elif engine == "gtts" and gtts_available:
-            bio = BytesIO()
-            t = gTTS(text=text, lang=lang)
-            t.write_to_fp(bio)
-            bio.seek(0)
-            return bio.read()
 
         # Engine not available or unsupported
         return None
@@ -443,12 +428,10 @@ def main():
         engine_options.append("Fish Audio")
     if SILICON_FLOW_API_KEY:
         engine_options.append("SiliconFlow")
-    if gtts_available:
-        engine_options.append("gTTS (Free)")
     
     if not engine_options:
         st.sidebar.warning("No TTS engines configured. Add API keys to .env file.")
-        selected_engine = "gTTS (Free)"
+        selected_engine = "none"
     else:
         selected_engine = st.sidebar.selectbox("Select TTS Engine", options=engine_options)
 
@@ -475,11 +458,6 @@ def main():
         sf_voices = ["default", "narrator_en", "narrator_zh", "casual_en", "casual_zh"]
         selected_voice = st.sidebar.selectbox("Select Voice", options=sf_voices)
         selected_lang = "en"
-    
-    elif selected_engine == "gTTS (Free)":
-        st.sidebar.markdown("**gTTS Language**")
-        gtts_langs = {"English": "en", "Spanish": "es", "French": "fr", "German": "de", "Chinese": "zh"}
-        selected_lang = st.sidebar.selectbox("Language", options=list(gtts_langs.values()), format_func=lambda x: [k for k, v in gtts_langs.items() if v == x][0])
     display_chat_history()
 
     # Initial Greeting with Typewriter Effect
@@ -581,7 +559,7 @@ def main():
                         st.warning("Could not generate speech. Check TTS engine API key and configuration.")
                         # Diagnostic info
                         try:
-                            st.info(f"Selected engine: {selected_engine} (key: {engine_key})")
+                            st.info(f"Selected engine: {selected_engine}")
                         except Exception:
                             pass
 
