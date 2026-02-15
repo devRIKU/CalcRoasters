@@ -64,10 +64,12 @@ def get_user_agent_string():
         return f"Error retrieving User-Agent: {e}"
 
 
-def generate_speech_sarvam(text: str, speaker: str = "Shubh", lang: str = "en-IN") -> bytes | None:
-    """Generate speech using Sarvam.ai TTS. Returns MP3 bytes or None on error."""
-    if not SARVAM_API_KEY or not text or not text.strip():
-        return None
+def generate_speech_sarvam(text: str, speaker: str = "Shubh", lang: str = "en-IN") -> tuple[bytes | None, str]:
+    """Generate speech using Sarvam.ai TTS. Returns (audio_bytes, error_msg)."""
+    if not SARVAM_API_KEY:
+        return None, "❌ Sarvam API key not set"
+    if not text or not text.strip():
+        return None, "❌ Text is empty"
     try:
         url = "https://api.sarvam.ai/text-to-speech"
         headers = {
@@ -85,16 +87,20 @@ def generate_speech_sarvam(text: str, speaker: str = "Shubh", lang: str = "en-IN
             data = resp.json()
             if "audios" in data and len(data["audios"]) > 0:
                 audio_b64 = data["audios"][0]
-                return base64.b64decode(audio_b64)
-        return None
-    except Exception:
-        return None
+                audio_bytes = base64.b64decode(audio_b64)
+                return audio_bytes, f"✅ Generated {len(audio_bytes)} bytes"
+            return None, f"❌ No audio in response: {data}"
+        return None, f"❌ API error {resp.status_code}: {resp.text}"
+    except Exception as e:
+        return None, f"❌ Sarvam error: {str(e)}"
 
 
-def generate_speech_fish_audio(text: str, voice_id: str = "default", lang: str = "en") -> bytes | None:
-    """Generate speech using Fish Audio TTS. Returns MP3 bytes or None on error."""
-    if not FISH_AUDIO_API_KEY or not text or not text.strip():
-        return None
+def generate_speech_fish_audio(text: str, voice_id: str = "default", lang: str = "en") -> tuple[bytes | None, str]:
+    """Generate speech using Fish Audio TTS. Returns (audio_bytes, error_msg)."""
+    if not FISH_AUDIO_API_KEY:
+        return None, "❌ Fish Audio API key not set"
+    if not text or not text.strip():
+        return None, "❌ Text is empty"
     try:
         url = "https://api.fish.audio/v1/tts"
         headers = {
@@ -108,16 +114,19 @@ def generate_speech_fish_audio(text: str, voice_id: str = "default", lang: str =
         }
         resp = requests.post(url, json=payload, headers=headers, timeout=30)
         if resp.status_code == 200:
-            return resp.content
-        return None
-    except Exception:
-        return None
+            audio_bytes = resp.content
+            return audio_bytes, f"✅ Generated {len(audio_bytes)} bytes"
+        return None, f"❌ API error {resp.status_code}: {resp.text}"
+    except Exception as e:
+        return None, f"❌ Fish Audio error: {str(e)}"
 
 
-def generate_speech_silicon_flow(text: str, model: str = "tts-default", voice: str = "default") -> bytes | None:
-    """Generate speech using SiliconFlow TTS. Returns MP3 bytes or None on error."""
-    if not SILICON_FLOW_API_KEY or not text or not text.strip():
-        return None
+def generate_speech_silicon_flow(text: str, model: str = "tts-default", voice: str = "default") -> tuple[bytes | None, str]:
+    """Generate speech using SiliconFlow TTS. Returns (audio_bytes, error_msg)."""
+    if not SILICON_FLOW_API_KEY:
+        return None, "❌ SiliconFlow API key not set"
+    if not text or not text.strip():
+        return None, "❌ Text is empty"
     try:
         url = "https://api.siliconflow.cn/v1/audio/speech"
         headers = {
@@ -132,16 +141,17 @@ def generate_speech_silicon_flow(text: str, model: str = "tts-default", voice: s
         }
         resp = requests.post(url, json=payload, headers=headers, timeout=30)
         if resp.status_code == 200:
-            return resp.content
-        return None
-    except Exception:
-        return None
+            audio_bytes = resp.content
+            return audio_bytes, f"✅ Generated {len(audio_bytes)} bytes"
+        return None, f"❌ API error {resp.status_code}: {resp.text}"
+    except Exception as e:
+        return None, f"❌ SiliconFlow error: {str(e)}"
 
 
-def generate_speech_any(text: str, engine: str = "sarvam", speaker_or_voice: str = "Shubh", lang: str = "en") -> bytes | None:
-    """Generate speech using the selected engine."""
+def generate_speech_any(text: str, engine: str = "sarvam", speaker_or_voice: str = "Shubh", lang: str = "en") -> tuple[bytes | None, str]:
+    """Generate speech using the selected engine. Returns (audio_bytes, error_msg)."""
     if not text or not text.strip():
-        return None
+        return None, "❌ Text is empty"
     try:
         if engine == "sarvam":
             return generate_speech_sarvam(text, speaker=speaker_or_voice, lang=lang)
@@ -149,11 +159,10 @@ def generate_speech_any(text: str, engine: str = "sarvam", speaker_or_voice: str
             return generate_speech_fish_audio(text, voice_id=speaker_or_voice, lang=lang)
         elif engine == "silicon_flow":
             return generate_speech_silicon_flow(text, voice=speaker_or_voice)
-
-        # Engine not available or unsupported
-        return None
-    except Exception:
-        return None
+        else:
+            return None, f"❌ Unknown engine: {engine}"
+    except Exception as e:
+        return None, f"❌ Error: {str(e)}"
 
 
 def play_audio_bytes(audio_bytes: bytes):
@@ -527,25 +536,22 @@ def main():
                     engine_map = {
                         "Sarvam.ai": "sarvam",
                         "Fish Audio": "fish_audio",
-                        "SiliconFlow": "silicon_flow",
-                        "gTTS (Free)": "gtts"
+                        "SiliconFlow": "silicon_flow"
                     }
-                    engine_key = engine_map.get(selected_engine, "gtts")
+                    engine_key = engine_map.get(selected_engine, "sarvam")
                     
-                    audio_bytes = generate_speech_any(response_text, engine=engine_key, speaker_or_voice=selected_voice, lang=selected_lang)
+                    audio_bytes, error_msg = generate_speech_any(response_text, engine=engine_key, speaker_or_voice=selected_voice, lang=selected_lang)
+                    
+                    # Show status
+                    st.info(error_msg)
+                    
                     if audio_bytes:
                         # Show audio player in the page
                         st.audio(audio_bytes, format="audio/mp3")
 
-                        # Show diagnostics so user can tell if bytes were produced
-                        try:
-                            st.success(f"Generated audio: {len(audio_bytes)} bytes")
-                        except Exception:
-                            pass
-
                         # Offer download button so user can play locally if browser blocks autoplay
                         try:
-                            st.download_button("Download audio", data=audio_bytes, file_name="sanniva_response.mp3", mime="audio/mpeg")
+                            st.download_button("⬇️ Download audio", data=audio_bytes, file_name="sanniva_response.mp3", mime="audio/mpeg")
                         except Exception:
                             pass
 
@@ -555,13 +561,6 @@ def main():
                                 play_audio_bytes(audio_bytes)
                             except Exception:
                                 st.warning("Failed to open local player.")
-                    else:
-                        st.warning("Could not generate speech. Check TTS engine API key and configuration.")
-                        # Diagnostic info
-                        try:
-                            st.info(f"Selected engine: {selected_engine}")
-                        except Exception:
-                            pass
 
 if __name__ == "__main__":
     main()
