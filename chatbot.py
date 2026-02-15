@@ -60,7 +60,12 @@ def get_user_agent_string():
     """Gets the raw User-Agent string from the current session's headers."""
     try:
         # Get the current session context
-        ctx = get_script_run_ctx()
+        try:
+            ctx = get_script_run_ctx()
+        except RuntimeError:
+            # Running outside Streamlit context (e.g., with `python chatbot.py`)
+            return "Running outside Streamlit context"
+        
         if ctx is None:
             return "Could not get session context."
         
@@ -148,7 +153,8 @@ def play_audio_bytes(audio_bytes: bytes):
 def get_os_from_user_agent(user_agent_string):
     """Uses the 'user-agents' library to parse OS info."""
     if not user_agent_string or "Not Found" in user_agent_string or "Error" in user_agent_string \
-       or "Could not get session context." in user_agent_string or "Could not get headers" in user_agent_string:
+       or "Could not get session context." in user_agent_string or "Could not get headers" in user_agent_string \
+       or "Running outside Streamlit context" in user_agent_string:
         return "Unknown OS"
     
     # Use the parsing library
