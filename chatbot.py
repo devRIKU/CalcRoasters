@@ -321,7 +321,7 @@ def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str,
                 conversation_context += f"{role_label}: {msg.get('content')}\n\n"
             full_prompt = f"{conversation_context}User: {prompt}"
             response = client.models.generate_content(
-                model="gemini-3.0-flash",
+                model="gemini-3.0-flash-preview",
                 config=types.GenerateContentConfig(
                     system_instruction=system_prompt,
                     thinking_config=types.ThinkingConfig(
