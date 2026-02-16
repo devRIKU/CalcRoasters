@@ -7,6 +7,7 @@ import sys
 import tempfile
 from groq import Groq
 from streamlit.runtime.scriptrunner import get_script_run_ctx
+import io
 from user_agents import parse  # You will need to install this!
 import requests
 import base64
@@ -320,7 +321,7 @@ def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str,
                 conversation_context += f"{role_label}: {msg.get('content')}\n\n"
             full_prompt = f"{conversation_context}User: {prompt}"
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.0-flash",
                 config=types.GenerateContentConfig(
                     system_instruction=system_prompt,
                     thinking_config=types.ThinkingConfig(
@@ -561,8 +562,18 @@ def main():
                     st.info(error_msg)
                     
                     if audio_bytes:
-                        # Show audio player in the page
-                        st.audio(audio_bytes, format="audio/mp3")
+                        # Provide a BytesIO to st.audio so Streamlit can play it reliably
+                        try:
+                            audio_buf = io.BytesIO(audio_bytes)
+                            audio_buf.seek(0)
+                            key_name = f"sanniva_audio_{int(time.time()*1000)}"
+                            st.audio(audio_buf, format="audio/mp3", start_time=0, key=key_name)
+                        except Exception:
+                            # Fallback to passing raw bytes
+                            try:
+                                st.audio(audio_bytes, format="audio/mp3")
+                            except Exception:
+                                pass
 
                         # Also attempt autoplay via an HTML audio tag (browsers may still block autoplay).
                         try:
