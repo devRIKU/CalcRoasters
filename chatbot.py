@@ -11,6 +11,12 @@ from user_agents import parse  # You will need to install this!
 import requests
 import base64
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # --- CONFIGURATION ---
 # Make sure these are set in your environment or Streamlit Secrets!
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
@@ -146,6 +152,11 @@ def generate_speech_silicon_flow(text: str, model: str = "tts-default", voice: s
         return None, f"❌ API error {resp.status_code}: {resp.text}"
     except Exception as e:
         return None, f"❌ SiliconFlow error: {str(e)}"
+
+
+def generate_speech_elevenlabs(text: str, voice_id: str = "21m00Tcm4TlvDq8ikWAM", model_id: str = "eleven_multilingual_v2") -> tuple[bytes | None, str]:
+    """Generate speech using ElevenLabs TTS. Returns (audio_bytes, error_msg)."""
+    return None, "❌ ElevenLabs support removed"
 
 
 def generate_speech_any(text: str, engine: str = "sarvam", speaker_or_voice: str = "Shubh", lang: str = "en") -> tuple[bytes | None, str]:
@@ -373,6 +384,19 @@ def build_system_prompt(base_prompt: str, personality: str, brain_type: str) -> 
 # Auto-personality detection removed — personality is now always manual via the sidebar selectbox
 
 def main():
+    raw_ua = get_user_agent_string()
+    user_os = get_os_from_user_agent(raw_ua)
+    user_os_lower = (user_os or "").lower()
+    try:
+        if user_os_lower == "windows":
+            st.sidebar.success("Hi Windows User! Arent you glad giving all your data to Microsoft?")
+        elif user_os_lower in ("mac os x", "macos", "mac os"):
+            st.sidebar.success("Hey Mac User! Enjoying the walled garden? Hope you like paying for wheels!")
+        elif user_os_lower == "android":
+            st.sidebar.success("Hello Android User! Enjoying the freedom of choice? Or is Google still tracking you?")
+    except Exception:
+        pass
+
     st.set_page_config(page_title="Sanniva AI", page_icon="🤖")
     st.title("Chat With Sanniva!")
     st.sidebar.info("I am Sanniva's Digital Twin! I can help with anything and roast you humorously.")
@@ -467,6 +491,8 @@ def main():
         sf_voices = ["default", "narrator_en", "narrator_zh", "casual_en", "casual_zh"]
         selected_voice = st.sidebar.selectbox("Select Voice", options=sf_voices)
         selected_lang = "en"
+
+    # (ElevenLabs support removed)
     display_chat_history()
 
     # Initial Greeting with Typewriter Effect
@@ -489,21 +515,10 @@ def main():
         st.session_state.greeting_shown = True
 
     # Retrieve user agent and OS info now that Streamlit context exists
-    raw_ua = get_user_agent_string()
-    user_os = get_os_from_user_agent(raw_ua)
-    user_os_lower = (user_os or "").lower()
+
 
     # Show OS-specific sidebar messages safely
-    try:
-        if user_os_lower == "windows":
-            st.sidebar.success("Hi Windows User! Arent you glad giving all your data to Microsoft?")
-        elif user_os_lower in ("mac os x", "macos", "mac os"):
-            st.sidebar.success("Hey Mac User! Enjoying the walled garden? Hope you like paying for wheels!")
-        elif user_os_lower == "android":
-            st.sidebar.success("Hello Android User! Enjoying the freedom of choice? Or is Google still tracking you?")
-    except Exception:
-        pass
-
+   
     # (No auto-personality) — personality comes from the sidebar selectbox
 
     catchy_text = get_catchy_phrase()
@@ -536,7 +551,7 @@ def main():
                     engine_map = {
                         "Sarvam.ai": "sarvam",
                         "Fish Audio": "fish_audio",
-                        "SiliconFlow": "silicon_flow"
+                        "SiliconFlow": "silicon_flow",
                     }
                     engine_key = engine_map.get(selected_engine, "sarvam")
                     
@@ -548,6 +563,14 @@ def main():
                     if audio_bytes:
                         # Show audio player in the page
                         st.audio(audio_bytes, format="audio/mp3")
+
+                        # Also attempt autoplay via an HTML audio tag (browsers may still block autoplay).
+                        try:
+                            b64_audio = base64.b64encode(audio_bytes).decode("ascii")
+                            html_player = f'<audio src="data:audio/mp3;base64,{b64_audio}" autoplay controls></audio>'
+                            st.markdown(html_player, unsafe_allow_html=True)
+                        except Exception:
+                            pass
 
                         # Offer download button so user can play locally if browser blocks autoplay
                         try:
