@@ -259,6 +259,8 @@ def initialize_session_state():
         st.session_state.personality_selector = "Roaster"
     if "greeting_shown" not in st.session_state:
         st.session_state.greeting_shown = False
+    if "audio_bytes" not in st.session_state:
+        st.session_state.audio_bytes = None
 
 def display_chat_history():
     """Display all messages in the chat history."""
@@ -321,7 +323,7 @@ def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str,
                 conversation_context += f"{role_label}: {msg.get('content')}\n\n"
             full_prompt = f"{conversation_context}User: {prompt}"
             response = client.models.generate_content(
-                model="gemini-3.0-flash-preview",
+                model="gemini-3-flash-preview",
                 config=types.GenerateContentConfig(
                     system_instruction=system_prompt,
                     thinking_config=types.ThinkingConfig(
@@ -525,6 +527,7 @@ def main():
     catchy_text = get_catchy_phrase()
 
     if prompt := st.chat_input(catchy_text):
+        st.session_state.audio_bytes = None
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
@@ -543,6 +546,8 @@ def main():
 
         display_and_store_response(response_text)
 
+    if st.session_state.messages and st.session_state.messages[-1]["role"] == "assistant":
+        last_response = st.session_state.messages[-1]["content"]
         # Add a "Speak" button to read the response aloud
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -556,7 +561,7 @@ def main():
                     }
                     engine_key = engine_map.get(selected_engine, "sarvam")
                     
-                    audio_bytes, error_msg = generate_speech_any(response_text, engine=engine_key, speaker_or_voice=selected_voice, lang=selected_lang)
+                    audio_bytes, error_msg = generate_speech_any(last_response, engine=engine_key, speaker_or_voice=selected_voice, lang=selected_lang)
                     
                     # Show status
                     st.info(error_msg)
