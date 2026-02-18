@@ -573,6 +573,13 @@ def main():
         selected_voice = st.sidebar.selectbox("Select Voice", options=sf_voices)
         selected_lang = "en"
 
+    # Option to use HTML autoplay (renders a single HTML audio element instead of Streamlit player)
+    use_html_autoplay = st.sidebar.checkbox("Use HTML autoplay for audio (single player)", value=False)
+    st.session_state.use_html_autoplay = use_html_autoplay
+    # Option to use a compact play/pause icon instead of a full player
+    compact_audio_icon = st.sidebar.checkbox("Compact audio icon (play/pause)", value=True)
+    st.session_state.compact_audio_icon = compact_audio_icon
+
     # (ElevenLabs support removed)
     display_chat_history()
 
@@ -652,26 +659,57 @@ def main():
                     st.info(error_msg)
                     
                     if audio_bytes:
-                        # Provide a BytesIO to st.audio so Streamlit can play it reliably
-                        try:
-                            audio_buf = io.BytesIO(audio_bytes)
-                            audio_buf.seek(0)
-                            key_name = f"sanniva_audio_{int(time.time()*1000)}"
-                            st.audio(audio_buf, format="audio/mp3", start_time=0, key=key_name)
-                        except Exception:
-                            # Fallback to passing raw bytes
+                        # If user chose HTML autoplay, render a single HTML audio element (avoids duplicate players)
+                        # If compact icon selected, render a small play/pause button that controls a hidden HTML audio element
+                        if st.session_state.get("compact_audio_icon", False):
                             try:
-                                st.audio(audio_bytes, format="audio/mp3")
+                                b64_audio = base64.b64encode(audio_bytes).decode("ascii")
+                                audio_id = f"audio_{int(time.time()*1000)}"
+                                btn_id = f"btn_{int(time.time()*1000)}"
+                                html_compact = f"""
+<div>
+  <button id="{btn_id}" aria-label="Play" style="font-size:20px; border:none; background:transparent; cursor:pointer;">▶️</button>
+  <audio id="{audio_id}" src="data:audio/mp3;base64,{b64_audio}"></audio>
+</div>
+<script>
+  const audio_{audio_id} = document.getElementById('{audio_id}');
+  const btn_{audio_id} = document.getElementById('{btn_id}');
+  btn_{audio_id}.onclick = function() {{
+    if (audio_{audio_id}.paused) {{
+      audio_{audio_id}.play();
+      btn_{audio_id}.innerText = '⏸️';
+    }} else {{
+      audio_{audio_id}.pause();
+      btn_{audio_id}.innerText = '▶️';
+    }}
+  }};
+  audio_{audio_id}.onended = function() {{ btn_{audio_id}.innerText = '▶️'; }};
+</script>
+"""
+                                st.markdown(html_compact, unsafe_allow_html=True)
                             except Exception:
-                                pass
-
-                        # Also attempt autoplay via an HTML audio tag (browsers may still block autoplay).
-                        try:
-                            b64_audio = base64.b64encode(audio_bytes).decode("ascii")
-                            html_player = f'<audio src="data:audio/mp3;base64,{b64_audio}" autoplay controls></audio>'
-                            st.markdown(html_player, unsafe_allow_html=True)
-                        except Exception:
-                            pass
+                                st.warning("Failed to render compact audio player.")
+                        else:
+                            if st.session_state.get("use_html_autoplay", False):
+                                try:
+                                    b64_audio = base64.b64encode(audio_bytes).decode("ascii")
+                                    html_player = f'<audio src="data:audio/mp3;base64,{b64_audio}" autoplay controls></audio>'
+                                    st.markdown(html_player, unsafe_allow_html=True)
+                                except Exception:
+                                    st.warning("Failed to render HTML audio player.")
+                            else:
+                                # Provide a BytesIO to st.audio so Streamlit can play it reliably
+                                try:
+                                    audio_buf = io.BytesIO(audio_bytes)
+                                    audio_buf.seek(0)
+                                    key_name = f"sanniva_audio_{int(time.time()*1000)}"
+                                    st.audio(audio_buf, format="audio/mp3", start_time=0, key=key_name)
+                                except Exception:
+                                    # Fallback to passing raw bytes
+                                    try:
+                                        st.audio(audio_bytes, format="audio/mp3")
+                                    except Exception:
+                                        st.warning("Failed to play audio via Streamlit player.")
 
                         # Offer download button so user can play locally if browser blocks autoplay
                         try:
