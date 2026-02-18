@@ -11,6 +11,7 @@ import io
 from user_agents import parse  # You will need to install this!
 import requests
 import base64
+import concurrent.futures
 
 try:
     from dotenv import load_dotenv
@@ -296,60 +297,103 @@ def load_system_prompt() -> str:
 def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str, chat_history: list, temperature: float) -> str:
     """Get AI response based on selected brain type."""
     try:
+        # helper to run a blocking call with a timeout using a thread
+        def run_with_timeout(fn, timeout_seconds: float):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(fn)
+                try:
+                    return fut.result(timeout=timeout_seconds)
+                except concurrent.futures.TimeoutError:
+                    raise TimeoutError("API call timed out")
+
         if brain_type == "Fast":
             # --- GROQ LOGIC ---
             if client2 is None:
                 return "Groq client not initialized."
-            messages = [{"role": "system", "content": system_prompt}]
+            # fallback chain for Groq models (from session_state if present)
+            groq_models = getattr(st.session_state, "groq_models", [
+                "llama-3.3-70b-versatile",
+                "mixtral-8x7b-32768",
+                "mixtral-7b"
+            ])
+            messages_base = [{"role": "system", "content": system_prompt}]
             for msg in chat_history[-10:]:
-                messages.append({"role": msg.get("role"), "content": msg.get("content")})
-            messages.append({"role": "user", "content": prompt})
-            response = client2.chat.completions.create(
-                messages=messages,  # type: ignore
-                model="llama-3.3-70b-versatile"
-            )
-            try:
-                return response.choices[0].message.content or "No response generated."
-            except Exception:
-                return str(response) or "No response generated."
+                messages_base.append({"role": msg.get("role"), "content": msg.get("content")})
+            messages_base.append({"role": "user", "content": prompt})
+
+            # default timeout (seconds) — can be overridden by caller via st.sidebar
+            timeout_seconds = getattr(st.session_state, "fallback_timeout", 3)
+
+            last_err = None
+            for model in groq_models:
+                try:
+                    def call_groq():
+                        return client2.chat.completions.create(messages=messages_base, model=model)
+
+                    response = run_with_timeout(call_groq, timeout_seconds)
+                    try:
+                        return response.choices[0].message.content or "No response generated."
+                    except Exception:
+                        return str(response) or "No response generated."
+                except Exception as e:
+                    last_err = e
+                    # try next model in the chain
+                    continue
+            # all Groq attempts failed
+            return "Sorry, I'm having trouble generating an answer right now. Please try again later."
 
         elif brain_type == "Thinker":
             # --- GEMINI LOGIC ---
             if client is None:
                 return "Gemini client not initialized."
+            # conversation assembly
             conversation_context = ""
             for msg in chat_history[-10:]:
                 role_label = "User" if msg.get("role") == "user" else "Assistant"
                 conversation_context += f"{role_label}: {msg.get('content')}\n\n"
             full_prompt = f"{conversation_context}User: {prompt}"
-            response = client.models.generate_content(
-                model="gemini-3-flash-preview",
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    thinking_config=types.ThinkingConfig(
-                        thinking_budget=8192
-                    ),
-                    temperature=temperature,
-                    safety_settings=[
-                        types.SafetySetting(
-                            category="HARM_CATEGORY_HARASSMENT",
-                            threshold="BLOCK_NONE"
-                        ),
-                        types.SafetySetting(
-                            category="HARM_CATEGORY_HATE_SPEECH",
-                            threshold="BLOCK_ONLY_HIGH"
+
+            # model fallback chain for Gemini (from session_state if present)
+            gemini_models = getattr(st.session_state, "gemini_models", [
+                "gemini-3-flash-preview",
+                "gemini-2.5-flash",
+                "gemini-2.5-lite"
+            ])
+
+            timeout_seconds = getattr(st.session_state, "fallback_timeout", 3)
+
+            last_err = None
+            for model in gemini_models:
+                try:
+                    def call_gemini():
+                        return client.models.generate_content(
+                            model=model,
+                            config=types.GenerateContentConfig(
+                                system_instruction=system_prompt,
+                                thinking_config=types.ThinkingConfig(thinking_budget=8192),
+                                temperature=temperature,
+                                safety_settings=[
+                                    types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
+                                    types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_ONLY_HIGH")
+                                ]
+                            ),
+                            contents=[full_prompt],
                         )
-                    ]
-                ),
-                contents=[full_prompt],
-            )
-            if getattr(response, "text", None):
-                return response.text
-            try:
-                # fallback if response structure differs
-                return str(response)
-            except Exception:
-                return "I'm speechless. (Safety filters might have blocked my response)."
+
+                    response = run_with_timeout(call_gemini, timeout_seconds)
+                    if getattr(response, "text", None):
+                        return response.text
+                    try:
+                        return str(response)
+                    except Exception:
+                        return "I'm speechless. (Safety filters might have blocked my response)."
+                except Exception as e:
+                    last_err = e
+                    # try next model in chain
+                    continue
+
+            # all Gemini attempts failed
+            return "Sorry, I'm having trouble generating an answer right now. Please try again later."
         else:
             return "Invalid brain type selected."
 
@@ -454,6 +498,29 @@ def main():
         value=0.7,
         step=0.1
     )
+
+    # Fallback timeout for trying alternate models (seconds)
+    st.sidebar.markdown("**Fallback Settings**")
+    fallback_timeout = st.sidebar.slider(
+        "Fallback timeout (seconds)",
+        min_value=1,
+        max_value=10,
+        value=2,
+        step=1,
+    )
+    st.session_state.fallback_timeout = fallback_timeout
+
+    # Model fallback chains (comma-separated). User can customize order here.
+    st.sidebar.markdown("**Model Fallback Chains**")
+    default_groq = "llama-3.3-70b-versatile,mixtral-8x7b-32768,mixtral-7b"
+    groq_chain_str = st.sidebar.text_input("Groq models (comma-separated)", value=default_groq)
+    groq_chain = [m.strip() for m in groq_chain_str.split(",") if m.strip()]
+    st.session_state.groq_models = groq_chain
+
+    default_gemini = "gemini-3-flash-preview,gemini-2.5-flash,gemini-2.5-lite"
+    gemini_chain_str = st.sidebar.text_input("Gemini models (comma-separated)", value=default_gemini)
+    gemini_chain = [m.strip() for m in gemini_chain_str.split(",") if m.strip()]
+    st.session_state.gemini_models = gemini_chain
 
     # --- TTS Engine & Voice Selector ---
     st.sidebar.markdown("**TTS Engine**")
