@@ -79,6 +79,14 @@ def generate_speech_sarvam(text: str, speaker: str = "Shubh", lang: str = "en-IN
     if not text or not text.strip():
         return None, "❌ Text is empty"
     try:
+        # Normalize speaker name to the expected lowercase tokens used by the Sarvam API
+        allowed_speakers = {"anushka","abhilash","manisha","vidya","arya","karun","hitesh","aditya","ritu","priya","neha","rahul","pooja","rohan","simran","kavya","amit","dev","ishita","shreya","ratan","varun","manan","sumit","roopa","kabir","aayan","shubh","ashutosh","advait","amelia","sophia","anand","tanya","tarun","sunny","mani","gokul","vijay","shruti","suhani","mohit","kavitha","rehan","soham","rupali"}
+        speaker_norm = (speaker or "").strip().lower()
+        fallback_note = ""
+        if speaker_norm not in allowed_speakers:
+            # fallback to a known default and inform the caller
+            fallback_note = f"❗ Speaker '{speaker}' not supported by Sarvam; falling back to 'shubh'."
+            speaker_norm = "shubh"
         url = "https://api.sarvam.ai/text-to-speech"
         headers = {
             "api-subscription-key": SARVAM_API_KEY,
@@ -87,7 +95,7 @@ def generate_speech_sarvam(text: str, speaker: str = "Shubh", lang: str = "en-IN
         payload = {
             "text": text,
             "target_language_code": lang,
-            "speaker": speaker,
+            "speaker": speaker_norm,
             "model": "bulbul:v3"
         }
         resp = requests.post(url, json=payload, headers=headers, timeout=30)
@@ -96,7 +104,10 @@ def generate_speech_sarvam(text: str, speaker: str = "Shubh", lang: str = "en-IN
             if "audios" in data and len(data["audios"]) > 0:
                 audio_b64 = data["audios"][0]
                 audio_bytes = base64.b64decode(audio_b64)
-                return audio_bytes, f"✅ Generated {len(audio_bytes)} bytes"
+                note = f"✅ Generated {len(audio_bytes)} bytes"
+                if fallback_note:
+                    note = fallback_note + " " + note
+                return audio_bytes, note
             return None, f"❌ No audio in response: {data}"
         return None, f"❌ API error {resp.status_code}: {resp.text}"
     except Exception as e:
@@ -627,8 +638,15 @@ def main():
                         "SiliconFlow": "silicon_flow",
                     }
                     engine_key = engine_map.get(selected_engine, "sarvam")
-                    
-                    audio_bytes, error_msg = generate_speech_any(last_response, engine=engine_key, speaker_or_voice=selected_voice, lang=selected_lang)
+                    # Normalize Sarvam speaker names to lowercase tokens expected by the API
+                    speaker_param = selected_voice
+                    if selected_engine == "Sarvam.ai":
+                        try:
+                            speaker_param = (selected_voice or "").strip().lower()
+                        except Exception:
+                            speaker_param = selected_voice
+
+                    audio_bytes, error_msg = generate_speech_any(last_response, engine=engine_key, speaker_or_voice=speaker_param, lang=selected_lang)
                     
                     # Show status
                     st.info(error_msg)
