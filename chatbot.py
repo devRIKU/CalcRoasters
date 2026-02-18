@@ -693,8 +693,36 @@ def main():
                             if st.session_state.get("use_html_autoplay", False):
                                 try:
                                     b64_audio = base64.b64encode(audio_bytes).decode("ascii")
-                                    html_player = f'<audio src="data:audio/mp3;base64,{b64_audio}" autoplay controls></audio>'
-                                    st.markdown(html_player, unsafe_allow_html=True)
+                                    audio_id = f"autoplay_audio_{int(time.time()*1000)}"
+                                                                        html_player = f"""
+<audio id="{audio_id}" src="data:audio/mp3;base64,{b64_audio}" style="display:none;"></audio>
+<button id="fallback_{audio_id}" style="font-size:18px; border:none; background:transparent; cursor:pointer; display:none;">▶️</button>
+<script>
+    var audio_el = document.getElementById('{audio_id}');
+    var btn = document.getElementById('fallback_{audio_id}');
+    if (audio_el) {{
+        audio_el.play().then(function() {{
+            // autoplay succeeded
+        }}).catch(function(e) {{
+            console.log('Autoplay prevented:', e);
+            if (btn) btn.style.display = 'inline';
+        }});
+    }}
+    if (btn) {{
+        btn.onclick = function() {{
+            if (audio_el.paused) {{
+                audio_el.play();
+                btn.innerText = '⏸️';
+            }} else {{
+                audio_el.pause();
+                btn.innerText = '▶️';
+            }}
+        }};
+    }}
+    if (audio_el) audio_el.onended = function() {{ if (btn) btn.innerText = '▶️'; }};
+</script>
+"""
+                                                                        st.markdown(html_player, unsafe_allow_html=True)
                                 except Exception:
                                     st.warning("Failed to render HTML audio player.")
                             else:
