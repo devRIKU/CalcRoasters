@@ -666,27 +666,14 @@ def main():
                                 b64_audio = base64.b64encode(audio_bytes).decode("ascii")
                                 audio_id = f"audio_{int(time.time()*1000)}"
                                 btn_id = f"btn_{int(time.time()*1000)}"
-                                html_compact = f"""
+                                                                # Use inline onclick handler to improve compatibility with Streamlit's HTML rendering
+                                                                html_compact = f"""
 <div>
-  <button id="{btn_id}" aria-label="Play" style="font-size:20px; border:none; background:transparent; cursor:pointer;">▶️</button>
-  <audio id="{audio_id}" src="data:audio/mp3;base64,{b64_audio}"></audio>
+    <button aria-label="Play" style="font-size:20px; border:none; background:transparent; cursor:pointer;" onclick="(function(a,b){{var audio=document.getElementById(a); if(!audio) return; if(audio.paused){{audio.play(); b.innerText='⏸️';}} else {{audio.pause(); b.innerText='▶️';}}}})('{audio_id}', this)">▶️</button>
+    <audio id="{audio_id}" src="data:audio/mp3;base64,{b64_audio}" style="display:none;"></audio>
 </div>
-<script>
-  const audio_{audio_id} = document.getElementById('{audio_id}');
-  const btn_{audio_id} = document.getElementById('{btn_id}');
-  btn_{audio_id}.onclick = function() {{
-    if (audio_{audio_id}.paused) {{
-      audio_{audio_id}.play();
-      btn_{audio_id}.innerText = '⏸️';
-    }} else {{
-      audio_{audio_id}.pause();
-      btn_{audio_id}.innerText = '▶️';
-    }}
-  }};
-  audio_{audio_id}.onended = function() {{ btn_{audio_id}.innerText = '▶️'; }};
-</script>
 """
-                                st.markdown(html_compact, unsafe_allow_html=True)
+                                                                st.markdown(html_compact, unsafe_allow_html=True)
                             except Exception:
                                 st.warning("Failed to render compact audio player.")
                         else:
@@ -694,32 +681,20 @@ def main():
                                 try:
                                     b64_audio = base64.b64encode(audio_bytes).decode("ascii")
                                     audio_id = f"autoplay_audio_{int(time.time()*1000)}"
+                                                                        # Try autoplay; if blocked, show a visible fallback button that uses an inline onclick handler
                                                                         html_player = f"""
 <audio id="{audio_id}" src="data:audio/mp3;base64,{b64_audio}" style="display:none;"></audio>
-<button id="fallback_{audio_id}" style="font-size:18px; border:none; background:transparent; cursor:pointer; display:none;">▶️</button>
+<button id="fallback_{audio_id}" style="font-size:18px; border:none; background:transparent; cursor:pointer; display:none;" onclick="(function(a,b){{var audio=document.getElementById(a); if(!audio) return; if(audio.paused){{audio.play(); b.innerText='⏸️';}} else {{audio.pause(); b.innerText='▶️';}}}})('{audio_id}', this)">▶️</button>
 <script>
     var audio_el = document.getElementById('{audio_id}');
     var btn = document.getElementById('fallback_{audio_id}');
-    if (audio_el) {{
-        audio_el.play().then(function() {{
-            // autoplay succeeded
-        }}).catch(function(e) {{
+    if (audio_el) {
+        audio_el.play().catch(function(e) {
             console.log('Autoplay prevented:', e);
             if (btn) btn.style.display = 'inline';
-        }});
-    }}
-    if (btn) {{
-        btn.onclick = function() {{
-            if (audio_el.paused) {{
-                audio_el.play();
-                btn.innerText = '⏸️';
-            }} else {{
-                audio_el.pause();
-                btn.innerText = '▶️';
-            }}
-        }};
-    }}
-    if (audio_el) audio_el.onended = function() {{ if (btn) btn.innerText = '▶️'; }};
+        });
+        audio_el.onended = function() { if (btn) btn.innerText = '▶️'; };
+    }
 </script>
 """
                                                                         st.markdown(html_player, unsafe_allow_html=True)
