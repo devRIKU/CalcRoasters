@@ -366,9 +366,9 @@ def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str,
 
             # model fallback chain for Gemini (from session_state if present)
             gemini_models = getattr(st.session_state, "gemini_models", [
-                "gemini-3-flash-preview",
-                "gemini-2.5-flash",
-                "gemini-2.5-lite"
+                "gemini-3.1-flash-lite",
+                "gemini-flash-latest",
+                "gemini-3-flash"
             ])
 
             timeout_seconds = getattr(st.session_state, "fallback_timeout", 3)
