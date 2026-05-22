@@ -60,4 +60,6 @@ user-agents==2.2.0
 watchdog==6.0.0
 websockets==15.0.1
 python-dotenv
+edge-tts
+gTTS
 

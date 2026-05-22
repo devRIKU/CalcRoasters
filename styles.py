@@ -32,6 +32,27 @@ def apply_theme(personality: str):
             "secondaryBackgroundColor": "#1e293b",
             "textColor": "#cbd5e1",
         },
+        # Hacker terminal: bright green on near-black.
+        "Tech Nerd": {
+            "primaryColor": "#00ff9c",
+            "backgroundColor": "#0a0f0d",
+            "secondaryBackgroundColor": "#11181a",
+            "textColor": "#b8f5d6",
+        },
+        # Warm cream + forest green: tea gardens & Sittong forest.
+        "Chill Squad": {
+            "primaryColor": "#7a9e6e",
+            "backgroundColor": "#f5efe2",
+            "secondaryBackgroundColor": "#e8e0cc",
+            "textColor": "#3d3a2f",
+        },
+        # Muted, drained-out night-of-homework palette.
+        "Exhausted Student": {
+            "primaryColor": "#6b6488",
+            "backgroundColor": "#1c1a26",
+            "secondaryBackgroundColor": "#262332",
+            "textColor": "#8e88a3",
+        },
     }
 
     selected_theme = themes.get(personality)

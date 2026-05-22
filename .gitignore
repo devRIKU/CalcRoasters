@@ -1,2 +1,24 @@
 GROQ_API_KEY.env
 app.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual envs
+.venv/
+venv/
+
+# Local secrets
+*.env
+.env
+.env.*
+!.env.example
+
+# Local state
+lore.json
+
+# Editor
+*.code-profile
+.vscode/
