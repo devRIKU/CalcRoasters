@@ -14,6 +14,7 @@ import os
 import sys
 import tempfile
 import time
+from datetime import date, datetime
 from typing import Any, Callable
 
 import requests
@@ -50,10 +51,12 @@ SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY")
 FISH_AUDIO_API_KEY = os.environ.get("FISH_AUDIO_API_KEY")
 SILICON_FLOW_API_KEY = os.environ.get("SILICON_FLOW_API_KEY")
 
+# Current Groq production models (verified May 2026).
+# mixtral-8x7b-32768 was deprecated 2025-03-20; mixtral-7b never existed.
 DEFAULT_GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "mixtral-8x7b-32768",
-    "mixtral-7b",
+    "llama-3.3-70b-versatile",   # primary, supports tool calling
+    "openai/gpt-oss-120b",       # backup, also supports tool calling
+    "llama-3.1-8b-instant",      # fast fallback
 ]
 DEFAULT_GEMINI_MODELS = [
     "gemini-flash-latest",
@@ -262,7 +265,9 @@ def get_catchy_phrase() -> str:
                     "with anything and roasts them humorously. Plain text only — no quotes or formatting. "
                     "Return only the phrase."},
             ],
-            model="mixtral-8x7b-32768",
+            # Smallest, fastest production model. Was the deprecated
+            # mixtral-8x7b-32768 (shutdown 2025-03-20).
+            model="llama-3.1-8b-instant",
         )
         return (response.choices[0].message.content or fallback).strip()
     except Exception:
@@ -414,8 +419,111 @@ TOOL_GUIDANCE = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Dynamic temporal context
+# ---------------------------------------------------------------------------
+
+# Sanniva is in 8th grade as of the 2026–27 academic year (starts April 2026).
+# The West Bengal school year runs April → March. We anchor 8th grade to the
+# 2026–27 academic year so the grade auto-advances every year on April 1.
+GRADE_START_YEAR = 2026   # academic year YYYY in which Sanniva is in 8th grade
+GRADE_START_LEVEL = 8
+
+
+def _academic_year_offset(today: date) -> int:
+    """Years elapsed since the GRADE_START_YEAR academic year began.
+
+    Academic year 2026–27 = 0 (Sanniva in 8th).
+    Boundary flips on April 1 each year.
+    """
+    if today.month >= 4:
+        current_ay = today.year
+    else:
+        current_ay = today.year - 1
+    return current_ay - GRADE_START_YEAR
+
+
+def _ordinal(n: int) -> str:
+    if 10 <= n % 100 <= 20:
+        suf = "th"
+    else:
+        suf = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suf}"
+
+
+def _school_phase(today: date) -> str:
+    """Return a short description of where you are in the school year."""
+    m, d = today.month, today.day
+    # April: brand new school year starts
+    if m == 4:
+        if d <= 10:
+            return ("School year just started — you're freshly promoted to a new grade. "
+                    "Books are still crisp, you're sizing up new teachers, the heat is "
+                    "already kicking in.")
+        return ("Early in the new school year — settling into the new grade. "
+                "Pre-summer heat is brutal in Nabagram.")
+    if m == 5:
+        return ("Deep into peak summer heat in West Bengal. Pre-monsoon misery. "
+                "First unit tests of the new school year are looming or just happened.")
+    if m == 6:
+        return ("Summer vacation territory in most West Bengal schools — and even when "
+                "school is on, attendance is patchy because of the heat. Pre-monsoon clouds "
+                "are building.")
+    if m == 7:
+        return ("Full monsoon. Streets flooding, classroom fans struggling, you're back "
+                "in the grind of the new academic year.")
+    if m == 8:
+        return ("Monsoon tapering. Independence Day energy. Mid-year syllabus is starting "
+                "to feel heavy.")
+    if m == 9:
+        return ("Pre-Puja crunch — half-yearly exams loom right before Durga Puja break. "
+                "Everyone is grinding.")
+    if m == 10:
+        if d <= 15:
+            return ("DURGA PUJA SEASON. The biggest festival of the year in West Bengal. "
+                    "Pandal hopping, new clothes, late nights, zero homework done.")
+        return ("Post-Puja comedown. Back to school. Diwali / Kali Puja around the corner.")
+    if m == 11:
+        return ("Post-festival grind. Weather is finally cooling down. "
+                "Second-half syllabus is getting real.")
+    if m == 12:
+        return ("Winter in Bengal — sweater weather, picnics, oranges. Year-end "
+                "school events. Annual exams are a couple months away.")
+    if m == 1:
+        return ("New year, but school is in annual-exam prep crunch mode. "
+                "Cold mornings, foggy bus rides.")
+    if m == 2:
+        return ("Annual exams happening or wrapping up. Maximum stress. "
+                "Saraswati Puja is the only fun thing this month.")
+    if m == 3:
+        return ("End of the school year. Exams done, results impending. "
+                "Mentally already on summer break. The current grade is about to end.")
+    return ""
+
+
+def build_temporal_context(today: date | None = None) -> str:
+    """Compose the live 'where in the calendar are we?' block for the AI."""
+    today = today or date.today()
+    grade = GRADE_START_LEVEL + _academic_year_offset(today)
+    grade_ord = _ordinal(grade)
+    day_name = today.strftime("%A")
+    pretty_date = today.strftime("%B %-d, %Y") if os.name != "nt" else today.strftime("%B %#d, %Y")
+
+    return (
+        "\n\n## Temporal Context (live, auto-updated each run)\n"
+        f"- Today is **{day_name}, {pretty_date}**.\n"
+        f"- You are currently in **{grade_ord} grade** at TIGPS Nabagram.\n"
+        f"- {_school_phase(today)}\n"
+        "- The West Bengal academic year runs **April → March**, so April 1 is when "
+        "you get promoted to the next grade.\n"
+        "- Reference the date / season / school phase only when it's naturally "
+        "relevant. Don't open every message with the date — that's weird.\n"
+    )
+
+
 def build_system_prompt(base: str, personality: str, brain_type: str, user_name: str = "") -> str:
-    prompt = (base or "") + PERSONALITY_SUFFIX.get(personality, "")
+    prompt = (base or "") + build_temporal_context()
+    prompt += PERSONALITY_SUFFIX.get(personality, "")
     if brain_type == "Thinker":
         prompt += " Use deep thinking to analyze the request before answering."
     prompt += TOOL_GUIDANCE
@@ -536,41 +644,71 @@ def _gemini_chat_with_tools(model: str, system_prompt: str, full_prompt: str, te
     return "Hmm, I got tangled up calling tools. Try asking again."
 
 
+def _format_brain_error(brain: str, attempts: list[tuple[str, Exception]]) -> str:
+    """Build a user-visible error that actually says what broke."""
+    if not attempts:
+        return f"Sorry, I couldn't reach {brain}. No models were even attempted."
+    last_model, last_err = attempts[-1]
+    summary = f"❌ All {brain} models failed.\n\nLast error on `{last_model}`:\n`{type(last_err).__name__}: {last_err}`"
+    if len(attempts) > 1:
+        tried = ", ".join(f"`{m}`" for m, _ in attempts)
+        summary += f"\n\nTried in order: {tried}"
+    summary += (
+        "\n\n**Common fixes:**\n"
+        "- Check `GROQ_API_KEY` / `GOOGLE_API_KEY` in your environment.\n"
+        "- Make sure the model IDs in the sidebar still exist on the provider.\n"
+        "- Increase the per-model timeout in the sidebar if you see TimeoutError."
+    )
+    return summary
+
+
 def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str, chat_history: list, temperature: float) -> str:
     """Call the selected brain (Fast=Groq, Thinker=Gemini) with model fallback."""
-    timeout = getattr(st.session_state, "fallback_timeout", 3)
+    # Realistic default: 70B models with tool calling + ~15kB system prompt
+    # routinely take 4–8s on first hit. Old 3s default would time out and
+    # silently skip to the next model in the chain.
+    timeout = getattr(st.session_state, "fallback_timeout", 15)
 
     if brain_type == "Fast":
         if groq_client is None:
-            return "Groq client not initialized."
+            return "❌ Groq client not initialized. Set `GROQ_API_KEY` in your environment."
         base = [{"role": "system", "content": system_prompt}]
         for m in chat_history[-10:]:
             if m.get("role") in ("user", "assistant"):
                 base.append({"role": m["role"], "content": m.get("content", "")})
         base.append({"role": "user", "content": prompt})
 
-        for model in getattr(st.session_state, "groq_models", DEFAULT_GROQ_MODELS):
+        attempts: list[tuple[str, Exception]] = []
+        models = getattr(st.session_state, "groq_models", DEFAULT_GROQ_MODELS)
+        for model in models:
             try:
                 return _groq_chat_with_tools(model, list(base), timeout)
-            except Exception:
+            except Exception as e:
+                attempts.append((model, e))
+                # Print to server log so you can grep the traceback there too.
+                print(f"[Groq] {model} failed: {type(e).__name__}: {e}", file=sys.stderr)
                 continue
-        return "Sorry, I'm having trouble generating an answer right now. Please try again later."
+        return _format_brain_error("Groq", attempts)
 
     if brain_type == "Thinker":
         if gemini_client is None:
-            return "Gemini client not initialized."
+            return "❌ Gemini client not initialized. Set `GOOGLE_API_KEY` in your environment."
         ctx_parts = [
             f"{'User' if m.get('role') == 'user' else 'Assistant'}: {m.get('content')}"
             for m in chat_history[-10:]
         ]
         full_prompt = "\n\n".join(ctx_parts + [f"User: {prompt}"])
 
-        for model in getattr(st.session_state, "gemini_models", DEFAULT_GEMINI_MODELS):
+        attempts: list[tuple[str, Exception]] = []
+        models = getattr(st.session_state, "gemini_models", DEFAULT_GEMINI_MODELS)
+        for model in models:
             try:
                 return _gemini_chat_with_tools(model, system_prompt, full_prompt, temperature, timeout)
-            except Exception:
+            except Exception as e:
+                attempts.append((model, e))
+                print(f"[Gemini] {model} failed: {type(e).__name__}: {e}", file=sys.stderr)
                 continue
-        return "Sorry, I'm having trouble generating an answer right now. Please try again later."
+        return _format_brain_error("Gemini", attempts)
 
     return "Invalid brain type selected."
 
@@ -684,7 +822,11 @@ def _sidebar_model_settings() -> float:
     temperature = st.sidebar.slider("Creativity Level (Chaos)", 0.0, 1.0, 0.7, 0.1)
 
     st.sidebar.markdown("**Fallback Settings**")
-    st.session_state.fallback_timeout = st.sidebar.slider("Fallback timeout (seconds)", 1, 10, 2, 1)
+    st.session_state.fallback_timeout = st.sidebar.slider(
+        "Per-model timeout (seconds)", 5, 60, 15, 1,
+        help="How long to wait for each model before falling back to the next. "
+             "Bumped from 3s — large models with tool calling can easily take 4–8s.",
+    )
 
     st.sidebar.markdown("**Model Fallback Chains**")
     groq_chain = st.sidebar.text_input("Groq models (comma-separated)", value=",".join(DEFAULT_GROQ_MODELS))
