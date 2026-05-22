@@ -16,9 +16,6 @@ venv/
 .env.*
 !.env.example
 
-# Local state
-lore.json
-
 # Editor
 *.code-profile
 .vscode/
