@@ -102,6 +102,7 @@ def get_user_agent_string() -> str:
         return ""
 
 
+@st.cache_data(show_spinner=False)
 def get_os_from_user_agent(ua: str) -> str:
     """Return the OS family parsed from a User-Agent string ('' if unknown)."""
     if not ua:
@@ -557,23 +558,28 @@ def build_system_prompt(base: str, personality: str, brain_type: str, user_name:
 MAX_TOOL_HOPS = 2
 
 
-def _run_with_timeout(fn: Callable[[], Any], timeout_seconds: float) -> Any:
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        return ex.submit(fn).result(timeout=timeout_seconds)
-
-
 def _groq_chat_with_tools(model: str, messages: list, timeout_seconds: float) -> str:
     """Run a Groq chat completion with a bounded tool-calling loop."""
-    for _ in range(MAX_TOOL_HOPS):
-        def call():
-            return groq_client.chat.completions.create(
+    for hop in range(MAX_TOOL_HOPS):
+        # Disable tools on subsequent hops to force final text response and prevent loops.
+        if hop > 0:
+            response = groq_client.chat.completions.create(
+                messages=messages,
+                model=model,
+                tools=ai_tools.OPENAI_TOOLS,
+                tool_choice="none",
+                timeout=timeout_seconds,
+                max_completion_tokens=800,
+            )
+        else:
+            response = groq_client.chat.completions.create(
                 messages=messages,
                 model=model,
                 tools=ai_tools.OPENAI_TOOLS,
                 tool_choice="auto",
+                timeout=timeout_seconds,
                 max_completion_tokens=800,
             )
-        response = _run_with_timeout(call, timeout_seconds)
         try:
             msg = response.choices[0].message
         except Exception:
@@ -616,16 +622,21 @@ def _gemini_chat_with_tools(model: str, system_prompt: str, full_prompt: str, te
         thinking_config=types.ThinkingConfig(thinking_budget=1024),
         temperature=temperature,
         tools=ai_tools.build_gemini_tools() or None,
+        http_options=types.HttpOptions(timeout=int(timeout_seconds)),
         safety_settings=[
             types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
             types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_ONLY_HIGH"),
         ],
     )
 
-    for _ in range(MAX_TOOL_HOPS):
-        def call():
-            return gemini_client.models.generate_content(model=model, config=cfg, contents=contents)
-        response = _run_with_timeout(call, timeout_seconds)
+    for hop in range(MAX_TOOL_HOPS):
+        # Disable tools on subsequent hops to force final text response and prevent loops.
+        if hop > 0:
+            cfg.tool_config = types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(mode="NONE")
+            )
+
+        response = gemini_client.models.generate_content(model=model, config=cfg, contents=contents)
 
         fcalls = []
         try:
@@ -784,7 +795,7 @@ def _sidebar_identity() -> None:
 
     if st.session_state.get("user_name"):
         facts = lore_store.list_facts(st.session_state.user_name)
-        with st.sidebar.expander(f"📓 Lore for {st.session_state.user_name} ({len(facts)})", expanded=False):
+        with st.sidebar.expander(f"📓 Public Lore for {st.session_state.user_name} ({len(facts)})", expanded=False):
             if facts:
                 for f in facts:
                     st.markdown(f"- {f}")
@@ -1115,6 +1126,8 @@ def main() -> None:
                 st.session_state.messages, temperature_val,
             )
         display_and_store_response(response_text)
+        if st.session_state.get("_name_popup_pending"):
+            st.rerun()
 
     # --- Auto-play + manual speak controls for the latest assistant turn ---
     msgs = st.session_state.messages

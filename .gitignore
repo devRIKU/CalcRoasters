@@ -19,3 +19,14 @@ venv/
 # Editor
 *.code-profile
 .vscode/
+
+# Databases
+private_lore.db
+*.db
+
+# Generated audio
+*.mp3
+
+# Test scripts
+test_tts.py
+
