@@ -60,33 +60,52 @@ SILICON_FLOW_API_KEY = os.environ.get("SILICON_FLOW_API_KEY")
 # field. The 20b sibling has the same risk; our inline-pseudo-tool parser in
 # _extract_inline_tool_calls() recovers from it either way.
 DEFAULT_GROQ_MODELS = [
-    "llama-3.1-8b-instant",      # fastest default, supports tool calling
-    "llama-3.3-70b-versatile",   # higher-quality fallback
-    "openai/gpt-oss-20b",        # backup, also supports tool calling
+    # NOTE: llama-3.1-8b-instant has a low free-tier TPM cap (6000 tok/min)
+    # which the ~17kB system prompt blows through immediately, causing 413s.
+    # Put higher-TPM models first so the common case actually works.
+    "llama-3.3-70b-versatile",   # 300K TPM free tier, supports tool calling
+    "openai/gpt-oss-120b",       # 250K TPM, also supports tool calling
+    "llama-3.1-8b-instant",      # fastest, but limited TPM
 ]
+# Stable Gemini IDs as of May 2026. `gemini-3-flash-preview` was renamed to
+# `gemini-3.5-flash` on GA — using the old ID returns 404.
 DEFAULT_GEMINI_MODELS = [
-    "gemini-flash-latest",
-    "gemini-3-flash-preview",
-    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",          # GA, broadly available, fast
+    "gemini-3.5-flash",          # newest GA flash (more capable)
+    "gemini-2.5-flash-lite",     # cheapest fallback
 ]
 AVATAR_PATH = "sanniva_face.jpg"
 
 
-def _make_clients() -> tuple[Any, Any]:
-    """Build the Gemini + Groq clients, swallowing init errors."""
+def _make_clients() -> tuple[Any, Any, list[str]]:
+    """Build the Gemini + Groq clients independently. Returns
+    `(gemini_client, groq_client, error_messages)`. Either client can be
+    None — they're constructed in isolated try blocks so one failing
+    doesn't take the other down.
+    """
     g_client = grq_client = None
-    try:
-        g_client = genai.Client(api_key=GOOGLE_API_KEY)
-        grq_client = Groq(api_key=GROQ_API_KEY)
-    except Exception as e:
+    errors: list[str] = []
+
+    if not GOOGLE_API_KEY:
+        errors.append("`GOOGLE_API_KEY` not set — Thinker brain (Gemini) disabled.")
+    else:
         try:
-            st.error(f"Error initializing API clients: {e}. Check your API Keys!")
-        except Exception:
-            pass
-    return g_client, grq_client
+            g_client = genai.Client(api_key=GOOGLE_API_KEY)
+        except Exception as e:
+            errors.append(f"Gemini init failed: {type(e).__name__}: {e}")
+
+    if not GROQ_API_KEY:
+        errors.append("`GROQ_API_KEY` not set — Fast brain (Groq) disabled.")
+    else:
+        try:
+            grq_client = Groq(api_key=GROQ_API_KEY)
+        except Exception as e:
+            errors.append(f"Groq init failed: {type(e).__name__}: {e}")
+
+    return g_client, grq_client, errors
 
 
-gemini_client, groq_client = _make_clients()
+gemini_client, groq_client, _client_init_errors = _make_clients()
 
 
 # ---------------------------------------------------------------------------
@@ -580,7 +599,7 @@ def build_system_prompt(base: str, personality: str, brain_type: str, user_name:
 # Brain (LLM) interaction with tool-calling
 # ---------------------------------------------------------------------------
 
-MAX_TOOL_HOPS = 2
+MAX_TOOL_HOPS = 4
 
 # Matches the broken tool-call format some Groq models (notably gpt-oss-*)
 # emit inside `content` instead of the proper `tool_calls` array.
@@ -628,10 +647,10 @@ def _stream_groq_final(model: str, messages: list, timeout_seconds: float) -> It
     stream = groq_client.chat.completions.create(
         messages=messages,
         model=model,
-        tools=ai_tools.OPENAI_TOOLS,
-        tool_choice="none",
+        # Don't pass `tools` here; with tool_choice="none" some models still
+        # echo the schema or emit empty content. Plain prose mode is safer.
         timeout=timeout_seconds,
-        max_completion_tokens=800,
+        max_completion_tokens=1500,
         stream=True,
     )
     for chunk in stream:
@@ -656,14 +675,17 @@ def _groq_chat_with_tools(model: str, messages: list, timeout_seconds: float) ->
       4. Once no tools are pending, stream the final answer for low latency.
     """
     for hop in range(MAX_TOOL_HOPS):
-        response = groq_client.chat.completions.create(
+        kwargs = dict(
             messages=messages,
             model=model,
-            tools=ai_tools.OPENAI_TOOLS,
-            tool_choice="auto" if hop == 0 else "none",
             timeout=timeout_seconds,
-            max_completion_tokens=800,
+            max_completion_tokens=1500,
         )
+        if hop == 0:
+            # Only offer tools on the first hop; subsequent hops are pure prose.
+            kwargs["tools"] = ai_tools.OPENAI_TOOLS
+            kwargs["tool_choice"] = "auto"
+        response = groq_client.chat.completions.create(**kwargs)
         try:
             msg = response.choices[0].message
         except Exception:
@@ -740,10 +762,14 @@ def _gemini_chat_with_tools(model: str, system_prompt: str, full_prompt: str, te
     contents = [types.Content(role="user", parts=[types.Part(text=full_prompt)])]
     cfg = types.GenerateContentConfig(
         system_instruction=system_prompt,
-        thinking_config=types.ThinkingConfig(thinking_budget=1024),
+        # No `thinking_config` here: forcing a thinking budget makes flash
+        # models slow without quality gain for casual chat. The Thinker mode
+        # picks reasoning-capable models in the sidebar instead.
         temperature=temperature,
         tools=ai_tools.build_gemini_tools() or None,
-        http_options=types.HttpOptions(timeout=int(timeout_seconds)),
+        # Gemini SDK takes timeout in *milliseconds*. Don't undershoot — the
+        # 2.5/3.x flash models routinely take 6–15s with a 17kB system prompt.
+        http_options=types.HttpOptions(timeout=int(max(timeout_seconds, 25) * 1000)),
         safety_settings=[
             types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
             types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_ONLY_HIGH"),
@@ -751,13 +777,15 @@ def _gemini_chat_with_tools(model: str, system_prompt: str, full_prompt: str, te
     )
 
     for hop in range(MAX_TOOL_HOPS):
-        # Disable tools on subsequent hops to force final text response and prevent loops.
+        # Disable tools on subsequent hops to force a final text response.
         if hop > 0:
             cfg.tool_config = types.ToolConfig(
                 function_calling_config=types.FunctionCallingConfig(mode="NONE")
             )
 
-        response = gemini_client.models.generate_content(model=model, config=cfg, contents=contents)
+        response = gemini_client.models.generate_content(
+            model=model, config=cfg, contents=contents,
+        )
 
         fcalls = []
         try:
@@ -770,7 +798,11 @@ def _gemini_chat_with_tools(model: str, system_prompt: str, full_prompt: str, te
             pass
 
         if not fcalls:
-            return getattr(response, "text", None) or "I'm speechless. (Safety filters may have blocked my response.)"
+            text = getattr(response, "text", None)
+            if text and text.strip():
+                return text
+            # Empty text -> raise so outer loop tries the next model.
+            raise RuntimeError(f"{model} returned empty text")
 
         try:
             contents.append(response.candidates[0].content)
@@ -791,33 +823,56 @@ def _format_brain_error(brain: str, attempts: list[tuple[str, Exception]]) -> st
     if not attempts:
         return f"Sorry, I couldn't reach {brain}. No models were even attempted."
     last_model, last_err = attempts[-1]
+    err_str = str(last_err)
     summary = f"❌ All {brain} models failed.\n\nLast error on `{last_model}`:\n`{type(last_err).__name__}: {last_err}`"
     if len(attempts) > 1:
         tried = ", ".join(f"`{m}`" for m, _ in attempts)
         summary += f"\n\nTried in order: {tried}"
-    summary += (
-        "\n\n**Common fixes:**\n"
-        "- Check `GROQ_API_KEY` / `GOOGLE_API_KEY` in your environment.\n"
-        "- Make sure the model IDs in the sidebar still exist on the provider.\n"
-        "- Increase the per-model timeout in the sidebar if you see TimeoutError."
-    )
+
+    hints = []
+    if "rate_limit" in err_str or "TPM" in err_str or "Limit 6000" in err_str:
+        hints.append(
+            "**You're hitting Groq's free-tier tokens-per-minute cap.** "
+            "The system prompt is ~17kB. Either:\n"
+            "  - Wait 60s and try again, or\n"
+            "  - Use a model with higher TPM (llama-3.3-70b-versatile = 300K TPM), or\n"
+            "  - Shorten the system prompt, or\n"
+            "  - Upgrade at https://console.groq.com/settings/billing"
+        )
+    if "timeout" in err_str.lower() or "TimeoutError" in type(last_err).__name__:
+        hints.append("**Timeout.** Bump the per-model timeout slider in the sidebar.")
+    if "401" in err_str or "unauthorized" in err_str.lower():
+        hints.append(f"**Auth failed.** Check your `{brain.upper()}_API_KEY` value.")
+    if "404" in err_str or "not exist" in err_str:
+        hints.append("**Model ID not found.** Edit the model list in the sidebar.")
+
+    if not hints:
+        hints.append(
+            "Check the env vars, the model IDs in the sidebar, and the per-model timeout."
+        )
+    summary += "\n\n**Likely cause / fix:**\n" + "\n\n".join(hints)
     return summary
 
 
-def _groq_run_tools_then_stream(model: str, messages: list, timeout_seconds: float) -> Iterator[str]:
-    """Run any tool calls (non-streaming), then stream the final assistant text.
+def _groq_prepare_messages_with_tools(model: str, messages: list, timeout_seconds: float) -> tuple[list, str | None]:
+    """Run the non-streaming tool-discovery hop synchronously.
 
-    Yields plain text chunks. Falls back to yielding the full _groq_chat_with_tools
-    result as a single chunk if streaming setup fails partway.
+    Returns `(updated_messages, early_text)`:
+      - `early_text` is the assistant's final text if no tools were called
+        (so the caller can yield it directly without streaming).
+      - Otherwise `early_text` is None and `updated_messages` is ready for
+        a streaming final pass.
+
+    Raises on API/timeout errors so the outer fallback loop can pick a
+    different model.
     """
-    # First non-streaming hop: discover tool calls (structured or inline).
     response = groq_client.chat.completions.create(
         messages=messages,
         model=model,
         tools=ai_tools.OPENAI_TOOLS,
         tool_choice="auto",
         timeout=timeout_seconds,
-        max_completion_tokens=800,
+        max_completion_tokens=1500,
     )
     msg = response.choices[0].message
     content = msg.content or ""
@@ -833,9 +888,11 @@ def _groq_run_tools_then_stream(model: str, messages: list, timeout_seconds: flo
             content = cleaned
 
     if not normalised:
-        # No tools needed — just emit whatever the model already produced.
-        yield content or "No response generated."
-        return
+        # No tools needed — return text directly (skip streaming step).
+        if not content.strip():
+            # Empty content from this model — raise so we fall back.
+            raise RuntimeError(f"{model} returned empty content")
+        return messages, content
 
     messages.append({
         "role": "assistant",
@@ -853,9 +910,23 @@ def _groq_run_tools_then_stream(model: str, messages: list, timeout_seconds: flo
             "name": tc["name"],
             "content": ai_tools.dispatch_json(tc["name"], tc["arguments"]),
         })
+    return messages, None
 
-    # Final streaming pass: tools disabled, low-latency token-by-token.
-    yield from _stream_groq_final(model, messages, timeout_seconds)
+
+def _groq_run_tools_then_stream(model: str, messages: list, timeout_seconds: float) -> Iterator[str]:
+    """Run any tool calls (sync, fail-fast), then stream the final answer.
+
+    The first hop is materialised by the caller via _groq_prepare_messages_with_tools
+    so that timeouts/API errors there raise BEFORE any token is yielded — that
+    way the outer model-fallback loop in get_ai_response_with_brain still works.
+    """
+    updated, early_text = _groq_prepare_messages_with_tools(model, messages, timeout_seconds)
+    if early_text is not None:
+        # Yield as one chunk — no second round-trip needed.
+        yield early_text
+        return
+    # Stream the final answer; tools disabled so the model has to produce prose.
+    yield from _stream_groq_final(model, updated, timeout_seconds)
 
 
 def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str, chat_history: list, temperature: float, *, stream: bool = False):
@@ -864,10 +935,10 @@ def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str,
     With stream=True (Fast brain only), returns an Iterator[str] of text chunks
     instead of a single string, so the UI can render tokens as they arrive.
     """
-    # Realistic default: 70B models with tool calling + ~15kB system prompt
-    # routinely take 4–8s on first hit. Old 3s default would time out and
-    # silently skip to the next model in the chain.
-    timeout = getattr(st.session_state, "fallback_timeout", 8)
+    # Realistic default: 70B Groq models with tool calling + ~17kB system
+    # prompt routinely take 5–8s on first hit. Gemini "thinking" models can
+    # take 10–20s. Anything under 20s is asking for spurious timeouts.
+    timeout = getattr(st.session_state, "fallback_timeout", 25)
 
     if brain_type == "Fast":
         if groq_client is None:
@@ -883,7 +954,19 @@ def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str,
         for model in models:
             try:
                 if stream:
-                    return _groq_run_tools_then_stream(model, list(base), timeout)
+                    # IMPORTANT: do the first sync hop here (not lazily inside
+                    # the generator) so timeouts/API errors raise BEFORE the
+                    # UI starts consuming the stream. Otherwise the outer
+                    # fallback loop never sees the exception.
+                    msgs = list(base)
+                    prepared, early_text = _groq_prepare_messages_with_tools(model, msgs, timeout)
+                    if early_text is not None:
+                        # Wrap the single-string result as a one-shot iterator
+                        # so the caller still gets the streaming API.
+                        return iter([early_text])
+                    # Hand off to streaming. Subsequent stream errors fall
+                    # through to display_and_store_response's UI fallback.
+                    return _stream_groq_final(model, prepared, timeout)
                 return _groq_chat_with_tools(model, list(base), timeout)
             except Exception as e:
                 attempts.append((model, e))
@@ -1025,7 +1108,7 @@ def _sidebar_model_settings() -> float:
 
     st.sidebar.markdown("**Fallback Settings**")
     st.session_state.fallback_timeout = st.sidebar.slider(
-        "Per-model timeout (seconds)", 5, 60, 8, 1,
+        "Per-model timeout (seconds)", 5, 60, 25, 1,
         help="How long to wait for each model before falling back to the next. "
              "Lower values keep the UI responsive when other tools are running tests.",
     )
@@ -1273,6 +1356,11 @@ def main() -> None:
     st.set_page_config(page_title="Sanniva AI", page_icon="🤖")
     st.title("Chat With Sanniva!")
     st.sidebar.info("I am Sanniva's Digital Twin! I can help with anything and roast you humorously.")
+
+    # Surface init errors so missing API keys are obvious instead of
+    # silently failing on first chat.
+    for err in _client_init_errors:
+        st.sidebar.error(f"⚠️ {err}")
 
     initialize_session_state()
     _show_os_greeting()
