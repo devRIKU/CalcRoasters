@@ -30,6 +30,8 @@ from typing import Any
 
 LORE_FILE = os.path.join(os.path.dirname(__file__), "lore.json")
 _lock = threading.Lock()
+_cache: dict[str, Any] | None = None
+_cache_mtime: float | None = None
 
 
 def _empty_db() -> dict[str, Any]:
@@ -37,23 +39,37 @@ def _empty_db() -> dict[str, Any]:
 
 
 def _load() -> dict[str, Any]:
+    global _cache, _cache_mtime
     if not os.path.exists(LORE_FILE):
+        _cache = _empty_db()
+        _cache_mtime = None
         return _empty_db()
     try:
+        mtime = os.path.getmtime(LORE_FILE)
+        if _cache is not None and _cache_mtime == mtime:
+            return _cache
         with open(LORE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict) or "users" not in data:
             return _empty_db()
+        _cache = data
+        _cache_mtime = mtime
         return data
     except Exception:
         return _empty_db()
 
 
 def _save(db: dict[str, Any]) -> None:
+    global _cache, _cache_mtime
     tmp = LORE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(db, f, ensure_ascii=False, indent=2)
     os.replace(tmp, LORE_FILE)
+    _cache = db
+    try:
+        _cache_mtime = os.path.getmtime(LORE_FILE)
+    except Exception:
+        _cache_mtime = None
 
 
 def _key(name: str) -> str:

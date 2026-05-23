@@ -54,9 +54,9 @@ SILICON_FLOW_API_KEY = os.environ.get("SILICON_FLOW_API_KEY")
 # Current Groq production models (verified May 2026).
 # mixtral-8x7b-32768 was deprecated 2025-03-20; mixtral-7b never existed.
 DEFAULT_GROQ_MODELS = [
-    "llama-3.3-70b-versatile",   # primary, supports tool calling
+    "llama-3.1-8b-instant",      # fastest default, supports tool calling
+    "llama-3.3-70b-versatile",   # higher-quality fallback
     "openai/gpt-oss-120b",       # backup, also supports tool calling
-    "llama-3.1-8b-instant",      # fast fallback
 ]
 DEFAULT_GEMINI_MODELS = [
     "gemini-flash-latest",
@@ -274,14 +274,22 @@ def get_catchy_phrase() -> str:
         return fallback
 
 
-def stream_data_to_chat(text: str, delay: float = 0.02) -> None:
+def stream_data_to_chat(text: str, delay: float = 0.002) -> None:
     """Stream text into the current chat container with a typewriter effect."""
     placeholder = st.empty()
     full = ""
-    for token in text.split(" "):
+    tokens = text.split(" ")
+    # Rendering every word with sleeps can make Streamlit feel frozen, especially
+    # while another tool (Antigravity) is running tests. Keep the fun typewriter
+    # effect for short replies, but render long answers in fewer UI updates.
+    if len(tokens) > 80:
+        placeholder.markdown(text)
+        return
+    for token in tokens:
         full += token + " "
         placeholder.markdown(full + "▌")
-        time.sleep(delay)
+        if delay > 0:
+            time.sleep(delay)
     placeholder.markdown(full)
 
 
@@ -329,6 +337,7 @@ def initialize_session_state() -> None:
         st.session_state.setdefault(key, value() if callable(value) else value)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_system_prompt() -> str:
     """Load the base system prompt (prefers .md, falls back to .txt)."""
     for path in ("System_prompt.md", "System_prompt.txt"):
@@ -545,7 +554,7 @@ def build_system_prompt(base: str, personality: str, brain_type: str, user_name:
 # Brain (LLM) interaction with tool-calling
 # ---------------------------------------------------------------------------
 
-MAX_TOOL_HOPS = 4
+MAX_TOOL_HOPS = 2
 
 
 def _run_with_timeout(fn: Callable[[], Any], timeout_seconds: float) -> Any:
@@ -562,6 +571,7 @@ def _groq_chat_with_tools(model: str, messages: list, timeout_seconds: float) ->
                 model=model,
                 tools=ai_tools.OPENAI_TOOLS,
                 tool_choice="auto",
+                max_completion_tokens=800,
             )
         response = _run_with_timeout(call, timeout_seconds)
         try:
@@ -603,7 +613,7 @@ def _gemini_chat_with_tools(model: str, system_prompt: str, full_prompt: str, te
     contents = [types.Content(role="user", parts=[types.Part(text=full_prompt)])]
     cfg = types.GenerateContentConfig(
         system_instruction=system_prompt,
-        thinking_config=types.ThinkingConfig(thinking_budget=8192),
+        thinking_config=types.ThinkingConfig(thinking_budget=1024),
         temperature=temperature,
         tools=ai_tools.build_gemini_tools() or None,
         safety_settings=[
@@ -667,13 +677,13 @@ def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str,
     # Realistic default: 70B models with tool calling + ~15kB system prompt
     # routinely take 4–8s on first hit. Old 3s default would time out and
     # silently skip to the next model in the chain.
-    timeout = getattr(st.session_state, "fallback_timeout", 15)
+    timeout = getattr(st.session_state, "fallback_timeout", 8)
 
     if brain_type == "Fast":
         if groq_client is None:
             return "❌ Groq client not initialized. Set `GROQ_API_KEY` in your environment."
         base = [{"role": "system", "content": system_prompt}]
-        for m in chat_history[-10:]:
+        for m in chat_history[-6:]:
             if m.get("role") in ("user", "assistant"):
                 base.append({"role": m["role"], "content": m.get("content", "")})
         base.append({"role": "user", "content": prompt})
@@ -695,7 +705,7 @@ def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str,
             return "❌ Gemini client not initialized. Set `GOOGLE_API_KEY` in your environment."
         ctx_parts = [
             f"{'User' if m.get('role') == 'user' else 'Assistant'}: {m.get('content')}"
-            for m in chat_history[-10:]
+            for m in chat_history[-6:]
         ]
         full_prompt = "\n\n".join(ctx_parts + [f"User: {prompt}"])
 
@@ -823,9 +833,9 @@ def _sidebar_model_settings() -> float:
 
     st.sidebar.markdown("**Fallback Settings**")
     st.session_state.fallback_timeout = st.sidebar.slider(
-        "Per-model timeout (seconds)", 5, 60, 15, 1,
+        "Per-model timeout (seconds)", 5, 60, 8, 1,
         help="How long to wait for each model before falling back to the next. "
-             "Bumped from 3s — large models with tool calling can easily take 4–8s.",
+             "Lower values keep the UI responsive when other tools are running tests.",
     )
 
     st.sidebar.markdown("**Model Fallback Chains**")
