@@ -10,12 +10,14 @@ from __future__ import annotations
 import base64
 import concurrent.futures
 import io
+import json
 import os
+import re
 import sys
 import tempfile
 import time
 from datetime import date, datetime
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import requests
 import streamlit as st
@@ -53,10 +55,14 @@ SILICON_FLOW_API_KEY = os.environ.get("SILICON_FLOW_API_KEY")
 
 # Current Groq production models (verified May 2026).
 # mixtral-8x7b-32768 was deprecated 2025-03-20; mixtral-7b never existed.
+# NOTE: openai/gpt-oss-120b was removed because it emitted tool calls as inline
+# "<function=name>{...}</function>" text instead of the structured `tool_calls`
+# field. The 20b sibling has the same risk; our inline-pseudo-tool parser in
+# _extract_inline_tool_calls() recovers from it either way.
 DEFAULT_GROQ_MODELS = [
     "llama-3.1-8b-instant",      # fastest default, supports tool calling
     "llama-3.3-70b-versatile",   # higher-quality fallback
-    "openai/gpt-oss-120b",       # backup, also supports tool calling
+    "openai/gpt-oss-20b",        # backup, also supports tool calling
 ]
 DEFAULT_GEMINI_MODELS = [
     "gemini-flash-latest",
@@ -302,16 +308,35 @@ def display_chat_history() -> None:
             st.markdown(msg.get("content", ""))
 
 
-def display_and_store_response(response_text: str) -> None:
-    response_text = response_text or ""
+def display_and_store_response(response: "str | Iterator[str]") -> str:
+    """Render an assistant response. Accepts a finished string OR a stream of
+    text chunks (from the Groq streaming path). Returns the full final text so
+    callers can store / replay it (e.g. auto-TTS).
+    """
+    full_text = ""
     with st.chat_message("assistant", avatar=get_avatar()):
-        try:
-            stream_data_to_chat(response_text)
-        except Exception:
-            st.markdown(response_text)
+        if isinstance(response, str):
+            full_text = response or ""
+            try:
+                stream_data_to_chat(full_text)
+            except Exception:
+                st.markdown(full_text)
+        else:
+            # Live token stream — render incrementally without per-token sleep.
+            placeholder = st.empty()
+            try:
+                for chunk in response:
+                    if not chunk:
+                        continue
+                    full_text += chunk
+                    placeholder.markdown(full_text + "▌")
+                placeholder.markdown(full_text or "No response generated.")
+            except Exception as e:
+                placeholder.markdown(full_text or f"❌ Streaming error: {e}")
     st.session_state.setdefault("messages", []).append(
-        {"role": "assistant", "content": response_text}
+        {"role": "assistant", "content": full_text}
     )
+    return full_text
 
 
 # ---------------------------------------------------------------------------
@@ -557,60 +582,156 @@ def build_system_prompt(base: str, personality: str, brain_type: str, user_name:
 
 MAX_TOOL_HOPS = 2
 
+# Matches the broken tool-call format some Groq models (notably gpt-oss-*)
+# emit inside `content` instead of the proper `tool_calls` array.
+# Examples handled:
+#   <function=recall_lore>{"user_name":"user"}</function>
+#   <function=remember_lore>{"user_name":"Sam","fact":"likes tea"}</function>
+_INLINE_TOOLCALL_RE = re.compile(
+    r"<function=([a-zA-Z_][a-zA-Z0-9_]*)>\s*(\{.*?\})\s*</function>",
+    re.DOTALL,
+)
+
+
+def _extract_inline_tool_calls(content: str) -> tuple[list[dict], str]:
+    """Pull pseudo-XML tool calls out of a model's text content.
+
+    Returns (parsed_calls, cleaned_text). `parsed_calls` mimics the shape of
+    OpenAI/Groq `tool_calls` so the rest of the loop can treat them uniformly.
+    """
+    if not content or "<function=" not in content:
+        return [], content
+    parsed: list[dict] = []
+    for i, m in enumerate(_INLINE_TOOLCALL_RE.finditer(content)):
+        name = m.group(1)
+        raw_args = m.group(2)
+        try:
+            json.loads(raw_args)  # validate
+            args_str = raw_args
+        except Exception:
+            args_str = "{}"
+        parsed.append({
+            "id": f"inline_{i}_{int(time.time() * 1000)}",
+            "name": name,
+            "arguments": args_str,
+        })
+    cleaned = _INLINE_TOOLCALL_RE.sub("", content).strip()
+    return parsed, cleaned
+
+
+def _stream_groq_final(model: str, messages: list, timeout_seconds: float) -> Iterator[str]:
+    """Yield text chunks for the FINAL (no-tools) Groq completion.
+
+    Used after any tool-calling hops have resolved, so we can stream the
+    user-visible answer for faster perceived latency.
+    """
+    stream = groq_client.chat.completions.create(
+        messages=messages,
+        model=model,
+        tools=ai_tools.OPENAI_TOOLS,
+        tool_choice="none",
+        timeout=timeout_seconds,
+        max_completion_tokens=800,
+        stream=True,
+    )
+    for chunk in stream:
+        try:
+            delta = chunk.choices[0].delta
+            piece = getattr(delta, "content", None)
+        except Exception:
+            piece = None
+        if piece:
+            yield piece
+
 
 def _groq_chat_with_tools(model: str, messages: list, timeout_seconds: float) -> str:
-    """Run a Groq chat completion with a bounded tool-calling loop."""
+    """Run a Groq chat completion with a bounded tool-calling loop.
+
+    Strategy:
+      1. First hop is non-streaming with tool_choice="auto" so we can inspect
+         tool_calls (streaming + tools is messy across SDKs).
+      2. If structured tool_calls come back -> run them, then re-loop.
+      3. If the model emits the broken <function=...> pseudo-XML inside
+         content -> parse it ourselves, treat as real tool calls, re-loop.
+      4. Once no tools are pending, stream the final answer for low latency.
+    """
     for hop in range(MAX_TOOL_HOPS):
-        # Disable tools on subsequent hops to force final text response and prevent loops.
-        if hop > 0:
-            response = groq_client.chat.completions.create(
-                messages=messages,
-                model=model,
-                tools=ai_tools.OPENAI_TOOLS,
-                tool_choice="none",
-                timeout=timeout_seconds,
-                max_completion_tokens=800,
-            )
-        else:
-            response = groq_client.chat.completions.create(
-                messages=messages,
-                model=model,
-                tools=ai_tools.OPENAI_TOOLS,
-                tool_choice="auto",
-                timeout=timeout_seconds,
-                max_completion_tokens=800,
-            )
+        response = groq_client.chat.completions.create(
+            messages=messages,
+            model=model,
+            tools=ai_tools.OPENAI_TOOLS,
+            tool_choice="auto" if hop == 0 else "none",
+            timeout=timeout_seconds,
+            max_completion_tokens=800,
+        )
         try:
             msg = response.choices[0].message
         except Exception:
             return str(response) or "No response generated."
 
+        content = msg.content or ""
         tool_calls = getattr(msg, "tool_calls", None) or []
-        if not tool_calls:
-            return msg.content or "No response generated."
 
+        # Normalise structured tool calls into a common shape.
+        normalised: list[dict] = [
+            {
+                "id": tc.id,
+                "name": tc.function.name,
+                "arguments": tc.function.arguments or "{}",
+            }
+            for tc in tool_calls
+        ]
+
+        # Fallback: parse inline <function=...>{...}</function> blobs that some
+        # models (gpt-oss-*) wrongly put inside `content` instead of tool_calls.
+        if not normalised:
+            inline_calls, cleaned_content = _extract_inline_tool_calls(content)
+            if inline_calls:
+                print(
+                    f"[Groq] {model} emitted {len(inline_calls)} inline pseudo "
+                    f"tool call(s); recovering.",
+                    file=sys.stderr,
+                )
+                normalised = inline_calls
+                content = cleaned_content
+
+        if not normalised:
+            # Plain text answer — done. (Already non-streaming here; streaming
+            # only buys us time when we KNOW there were no tool calls to make,
+            # which we can only know after this first call.)
+            return content or "No response generated."
+
+        # Record assistant turn with the tool calls it made.
         messages.append({
             "role": "assistant",
-            "content": msg.content or "",
+            "content": content,
             "tool_calls": [
                 {
-                    "id": tc.id,
+                    "id": tc["id"],
                     "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments or "{}",
-                    },
+                    "function": {"name": tc["name"], "arguments": tc["arguments"]},
                 }
-                for tc in tool_calls
+                for tc in normalised
             ],
         })
-        for tc in tool_calls:
+        # Execute every requested tool and feed results back.
+        for tc in normalised:
             messages.append({
                 "role": "tool",
-                "tool_call_id": tc.id,
-                "name": tc.function.name,
-                "content": ai_tools.dispatch_json(tc.function.name, tc.function.arguments or "{}"),
+                "tool_call_id": tc["id"],
+                "name": tc["name"],
+                "content": ai_tools.dispatch_json(tc["name"], tc["arguments"]),
             })
+
+    # If we got here, we hit MAX_TOOL_HOPS without a clean final answer.
+    # Make one last streaming pass with tools disabled to force prose output.
+    try:
+        chunks = list(_stream_groq_final(model, messages, timeout_seconds))
+        final = "".join(chunks).strip()
+        if final:
+            return final
+    except Exception as e:
+        print(f"[Groq] final stream failed on {model}: {e}", file=sys.stderr)
     return "Hmm, I got tangled up calling tools. Try asking again."
 
 
@@ -683,8 +804,66 @@ def _format_brain_error(brain: str, attempts: list[tuple[str, Exception]]) -> st
     return summary
 
 
-def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str, chat_history: list, temperature: float) -> str:
-    """Call the selected brain (Fast=Groq, Thinker=Gemini) with model fallback."""
+def _groq_run_tools_then_stream(model: str, messages: list, timeout_seconds: float) -> Iterator[str]:
+    """Run any tool calls (non-streaming), then stream the final assistant text.
+
+    Yields plain text chunks. Falls back to yielding the full _groq_chat_with_tools
+    result as a single chunk if streaming setup fails partway.
+    """
+    # First non-streaming hop: discover tool calls (structured or inline).
+    response = groq_client.chat.completions.create(
+        messages=messages,
+        model=model,
+        tools=ai_tools.OPENAI_TOOLS,
+        tool_choice="auto",
+        timeout=timeout_seconds,
+        max_completion_tokens=800,
+    )
+    msg = response.choices[0].message
+    content = msg.content or ""
+    tool_calls = getattr(msg, "tool_calls", None) or []
+    normalised = [
+        {"id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments or "{}"}
+        for tc in tool_calls
+    ]
+    if not normalised:
+        inline_calls, cleaned = _extract_inline_tool_calls(content)
+        if inline_calls:
+            normalised = inline_calls
+            content = cleaned
+
+    if not normalised:
+        # No tools needed — just emit whatever the model already produced.
+        yield content or "No response generated."
+        return
+
+    messages.append({
+        "role": "assistant",
+        "content": content,
+        "tool_calls": [
+            {"id": tc["id"], "type": "function",
+             "function": {"name": tc["name"], "arguments": tc["arguments"]}}
+            for tc in normalised
+        ],
+    })
+    for tc in normalised:
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tc["id"],
+            "name": tc["name"],
+            "content": ai_tools.dispatch_json(tc["name"], tc["arguments"]),
+        })
+
+    # Final streaming pass: tools disabled, low-latency token-by-token.
+    yield from _stream_groq_final(model, messages, timeout_seconds)
+
+
+def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str, chat_history: list, temperature: float, *, stream: bool = False):
+    """Call the selected brain (Fast=Groq, Thinker=Gemini) with model fallback.
+
+    With stream=True (Fast brain only), returns an Iterator[str] of text chunks
+    instead of a single string, so the UI can render tokens as they arrive.
+    """
     # Realistic default: 70B models with tool calling + ~15kB system prompt
     # routinely take 4–8s on first hit. Old 3s default would time out and
     # silently skip to the next model in the chain.
@@ -703,6 +882,8 @@ def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str,
         models = getattr(st.session_state, "groq_models", DEFAULT_GROQ_MODELS)
         for model in models:
             try:
+                if stream:
+                    return _groq_run_tools_then_stream(model, list(base), timeout)
                 return _groq_chat_with_tools(model, list(base), timeout)
             except Exception as e:
                 attempts.append((model, e))
@@ -1120,12 +1301,17 @@ def main() -> None:
             user_name=st.session_state.get("user_name", ""),
         )
 
+        # Fast brain streams; Thinker brain still returns a finished string.
+        use_stream = (brain_type == "Fast")
         with st.spinner("Thinking..." if brain_type == "Thinker" else "Generating..."):
-            response_text = get_ai_response_with_brain(
+            response = get_ai_response_with_brain(
                 prompt, system_prompt, brain_type,
                 st.session_state.messages, temperature_val,
+                stream=use_stream,
             )
-        display_and_store_response(response_text)
+        display_and_store_response(response)
+        # If a tool flipped the popup flag (e.g. request_user_name), rerun so
+        # _maybe_show_name_popup() at the top of main() actually fires it.
         if st.session_state.get("_name_popup_pending"):
             st.rerun()
 
