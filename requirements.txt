@@ -62,4 +62,6 @@ websockets==15.0.1
 python-dotenv
 edge-tts
 gTTS
+firebase-admin
+
 
