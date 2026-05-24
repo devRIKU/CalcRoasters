@@ -67,12 +67,13 @@ DEFAULT_GROQ_MODELS = [
     "openai/gpt-oss-120b",       # 250K TPM, also supports tool calling
     "llama-3.1-8b-instant",      # fastest, but limited TPM
 ]
-# Stable Gemini IDs as of May 2026. `gemini-3-flash-preview` was renamed to
-# `gemini-3.5-flash` on GA — using the old ID returns 404.
+# Gemini IDs as of May 2026. Order = preference: newest GA first, preview
+# second (may 404 if the project lacks preview access — we just skip it),
+# then the cheap/fast lite as a final fallback.
 DEFAULT_GEMINI_MODELS = [
-    "gemini-2.5-flash",          # GA, broadly available, fast
-    "gemini-3.5-flash",          # newest GA flash (more capable)
-    "gemini-2.5-flash-lite",     # cheapest fallback
+    "gemini-3.5-flash",          # newest GA flash, strongest reasoning here
+    "gemini-3-flash-preview",    # preview build of the 3.x flash line
+    "gemini-3.1-flash-lite",     # cheapest, fastest fallback in the 3.x family
 ]
 AVATAR_PATH = "sanniva_face.jpg"
 
@@ -601,14 +602,24 @@ def build_system_prompt(base: str, personality: str, brain_type: str, user_name:
 
 MAX_TOOL_HOPS = 4
 
-# Matches the broken tool-call format some Groq models (notably gpt-oss-*)
-# emit inside `content` instead of the proper `tool_calls` array.
-# Examples handled:
-#   <function=recall_lore>{"user_name":"user"}</function>
+# Matches the broken tool-call format some Groq / Gemini models emit inside
+# `content` instead of using the proper `tool_calls` / `function_call` field.
+# Variants observed in the wild (all handled):
 #   <function=remember_lore>{"user_name":"Sam","fact":"likes tea"}</function>
+#   <function=name:remember_lore {"user_name":"Sam","fact":"likes tea"}</function>
+#   <function=name:remember_lore>{"user_name":"Sam","fact":"likes tea"}</function>
+#   <function name="remember_lore">{"user_name":"Sam"}</function>
+# The body is anything containing a JSON object; we extract the first {...} we
+# can balance-parse, ignoring whatever junk separates the name from the args.
 _INLINE_TOOLCALL_RE = re.compile(
-    r"<function=([a-zA-Z_][a-zA-Z0-9_]*)>\s*(\{.*?\})\s*</function>",
-    re.DOTALL,
+    r"""<function\s*                              # opening tag, allow whitespace
+        (?:=|\s)\s*                               # = or whitespace separator
+        (?:name\s*[:=]\s*)?                       # optional 'name:' / 'name=' prefix
+        ["']?([a-zA-Z_][a-zA-Z0-9_]*)["']?        # 1: function name (maybe quoted)
+        \s*>?\s*                                  # optional closing '>'
+        (\{.*?\})                                 # 2: JSON args (non-greedy)
+        \s*</function\s*>""",
+    re.DOTALL | re.VERBOSE,
 )
 
 
@@ -618,7 +629,7 @@ def _extract_inline_tool_calls(content: str) -> tuple[list[dict], str]:
     Returns (parsed_calls, cleaned_text). `parsed_calls` mimics the shape of
     OpenAI/Groq `tool_calls` so the rest of the loop can treat them uniformly.
     """
-    if not content or "<function=" not in content:
+    if not content or "<function" not in content:
         return [], content
     parsed: list[dict] = []
     for i, m in enumerate(_INLINE_TOOLCALL_RE.finditer(content)):
@@ -636,6 +647,20 @@ def _extract_inline_tool_calls(content: str) -> tuple[list[dict], str]:
         })
     cleaned = _INLINE_TOOLCALL_RE.sub("", content).strip()
     return parsed, cleaned
+
+
+def _strip_inline_tool_noise(text: str) -> str:
+    """Remove any leftover `<function=...>...</function>` pseudo-XML from
+    text that's about to be shown to the user. Used as a last-line defence
+    when a model emits the blob but we already finished tool-calling hops.
+    """
+    if not text or "<function" not in text:
+        return text
+    cleaned = _INLINE_TOOLCALL_RE.sub("", text)
+    # Also nuke malformed/stray tags that didn't match the full pattern
+    # (e.g. unterminated or missing JSON body).
+    cleaned = re.sub(r"</?function[^>]*>", "", cleaned)
+    return cleaned.strip()
 
 
 def _stream_groq_final(model: str, messages: list, timeout_seconds: float) -> Iterator[str]:
@@ -721,7 +746,7 @@ def _groq_chat_with_tools(model: str, messages: list, timeout_seconds: float) ->
             # Plain text answer — done. (Already non-streaming here; streaming
             # only buys us time when we KNOW there were no tool calls to make,
             # which we can only know after this first call.)
-            return content or "No response generated."
+            return _strip_inline_tool_noise(content) or "No response generated."
 
         # Record assistant turn with the tool calls it made.
         messages.append({
@@ -800,7 +825,35 @@ def _gemini_chat_with_tools(model: str, system_prompt: str, full_prompt: str, te
         if not fcalls:
             text = getattr(response, "text", None)
             if text and text.strip():
-                return text
+                # Some Gemini flash builds (esp. 3.x previews) occasionally emit
+                # tool calls as inline `<function=...>{...}</function>` text
+                # instead of structured function_call parts. If we spot one,
+                # execute it ourselves and continue the loop instead of leaking
+                # the raw pseudo-XML to the user.
+                inline_calls, cleaned_text = _extract_inline_tool_calls(text)
+                if inline_calls:
+                    print(
+                        f"[Gemini] {model} emitted {len(inline_calls)} inline "
+                        f"pseudo tool call(s); recovering."
+                    )
+                    try:
+                        contents.append(response.candidates[0].content)
+                    except Exception:
+                        pass
+                    for ic in inline_calls:
+                        try:
+                            args = json.loads(ic["arguments"] or "{}")
+                        except Exception:
+                            args = {}
+                        result = ai_tools.dispatch(ic["name"], args)
+                        contents.append(types.Content(
+                            role="user",
+                            parts=[types.Part.from_function_response(
+                                name=ic["name"], response=result,
+                            )],
+                        ))
+                    continue
+                return _strip_inline_tool_noise(text)
             # Empty text -> raise so outer loop tries the next model.
             raise RuntimeError(f"{model} returned empty text")
 
@@ -892,7 +945,7 @@ def _groq_prepare_messages_with_tools(model: str, messages: list, timeout_second
         if not content.strip():
             # Empty content from this model — raise so we fall back.
             raise RuntimeError(f"{model} returned empty content")
-        return messages, content
+        return messages, _strip_inline_tool_noise(content)
 
     messages.append({
         "role": "assistant",
