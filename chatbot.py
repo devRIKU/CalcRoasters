@@ -237,6 +237,13 @@ TTS_DISPATCH: dict[str, Callable[..., tuple[bytes | None, str]]] = {
 }
 
 
+# Below this byte-count we treat the response as a degenerate empty audio
+# stream (mp3 frame headers alone are ~150 bytes; any real speech is >1 KB).
+# This catches the "Bing TTS returned a few frames of silence" failure mode
+# that otherwise renders as a player that just clicks and stops.
+_MIN_AUDIO_BYTES = 256
+
+
 def generate_speech_any(text: str, engine: str, voice: str = "default", lang: str = "en") -> tuple[bytes | None, str]:
     """Dispatch to the requested TTS engine."""
     if not text or not text.strip():
@@ -245,9 +252,19 @@ def generate_speech_any(text: str, engine: str, voice: str = "default", lang: st
     if not fn:
         return None, f"❌ Unknown engine: {engine}"
     try:
-        return fn(text, voice, lang)
+        audio, status = fn(text, voice, lang)
     except Exception as e:
-        return None, f"❌ Error: {e}"
+        return None, f"❌ {engine} crashed: {type(e).__name__}: {e}"
+
+    # Guard against "successful" but suspiciously tiny responses — those
+    # render as a silent / blank player which is what the user complained
+    # about. Promote them to an explicit failure so the UI shows an error.
+    if audio is not None and len(audio) < _MIN_AUDIO_BYTES:
+        return None, (
+            f"❌ {engine} returned only {len(audio)} bytes — likely empty audio. "
+            f"Original status: {status}"
+        )
+    return audio, status
 
 
 def play_audio_bytes(audio_bytes: bytes) -> None:
@@ -264,8 +281,13 @@ def play_audio_bytes(audio_bytes: bytes) -> None:
             os.system(f"open {path}")
         else:
             os.system(f"xdg-open {path}")
-    except Exception:
-        pass
+    except Exception as e:
+        # Don't swallow silently — the user clicked "Open local player" and
+        # deserves to know why nothing happened.
+        try:
+            st.warning(f"Couldn't open local audio player: {e}")
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1343,9 +1365,13 @@ def _handle_speak_button(last_response: str, engine_label: str, voice: str, lang
         return
     with st.spinner("Generating speech..."):
         audio_bytes, status = _tts_for_engine(last_response, engine_label, voice, lang)
-    st.info(status)
+    # Show failures as errors (red) instead of info (blue) so blank-audio
+    # bugs are immediately obvious.
     if audio_bytes:
+        st.info(status)
         render_audio_player(audio_bytes)
+    else:
+        st.error(status or "TTS failed with no status message.")
 
 
 def _maybe_autoplay_response(engine_label: str, voice: str, lang: str) -> None:
@@ -1377,7 +1403,13 @@ def _maybe_autoplay_response(engine_label: str, voice: str, lang: str) -> None:
         render_audio_player(audio_bytes, force_autoplay=True,
                             show_download=False, show_local_open=False)
     else:
-        st.caption(f"Auto-play skipped: {status}")
+        # Surface real failures (network, bad voice ID, missing dep) as an
+        # error banner — they used to disappear into a tiny grey caption and
+        # the user just saw a missing/blank audio player.
+        if status.startswith("❌"):
+            st.error(f"TTS failed: {status}")
+        else:
+            st.caption(f"Auto-play skipped: {status}")
 
 
 # ---------------------------------------------------------------------------
