@@ -5,6 +5,7 @@ A personality-driven chatbot with two brains (Groq for fast answers, Gemini
 for deep thinking), per-user lore memory, tool/function calling and a free
 TTS option out of the box.
 """
+
 from __future__ import annotations
 
 import base64
@@ -38,6 +39,7 @@ from tts_free import (
 
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except ImportError:
     pass
@@ -55,25 +57,27 @@ SILICON_FLOW_API_KEY = os.environ.get("SILICON_FLOW_API_KEY")
 
 # Current Groq production models (verified May 2026).
 # mixtral-8x7b-32768 was deprecated 2025-03-20; mixtral-7b never existed.
-# NOTE: openai/gpt-oss-120b was removed because it emitted tool calls as inline
-# "<function=name>{...}</function>" text instead of the structured `tool_calls`
-# field. The 20b sibling has the same risk; our inline-pseudo-tool parser in
-# _extract_inline_tool_calls() recovers from it either way.
+# Inline-pseudo-tool parser in _extract_inline_tool_calls() recovers from
+# models (like gpt-oss-*) that emit <function=...>{...}</function> as text.
+#
+# llama-3.1-8b-instant has a low free-tier TPM cap (6000 tok/min) which the
+# ~17kB system prompt blows through immediately. We keep it in the catalogue
+# (LOW_TPM_GROQ_MODELS) but NOT in the default fallback chain — it was the
+# source of "rate-limit" errors that confused the model-changer UI.
 DEFAULT_GROQ_MODELS = [
-    # NOTE: llama-3.1-8b-instant has a low free-tier TPM cap (6000 tok/min)
-    # which the ~17kB system prompt blows through immediately, causing 413s.
-    # Put higher-TPM models first so the common case actually works.
-    "llama-3.3-70b-versatile",   # 300K TPM free tier, supports tool calling
-    "openai/gpt-oss-120b",       # 250K TPM, also supports tool calling
-    "llama-3.1-8b-instant",      # fastest, but limited TPM
+    "llama-3.3-70b-versatile",  # 300K TPM free tier, supports tool calling
+    "openai/gpt-oss-120b",  # 250K TPM, also supports tool calling
 ]
+LOW_TPM_GROQ_MODELS = {
+    "llama-3.1-8b-instant": "6,000 TPM — the system prompt alone may exceed the per-minute cap.",
+}
 # Gemini IDs as of May 2026. Order = preference: newest GA first, preview
 # second (may 404 if the project lacks preview access — we just skip it),
 # then the cheap/fast lite as a final fallback.
 DEFAULT_GEMINI_MODELS = [
-    "gemini-3.5-flash",          # newest GA flash, strongest reasoning here
-    "gemini-3-flash-preview",    # preview build of the 3.x flash line
-    "gemini-3.1-flash-lite",     # cheapest, fastest fallback in the 3.x family
+    "gemini-3.5-flash",  # newest GA flash, strongest reasoning here
+    "gemini-3-flash-preview",  # preview build of the 3.x flash line
+    "gemini-3.1-flash-lite",  # cheapest, fastest fallback in the 3.x family
 ]
 AVATAR_PATH = "sanniva_face.jpg"
 
@@ -110,8 +114,86 @@ gemini_client, groq_client, _client_init_errors = _make_clients()
 
 
 # ---------------------------------------------------------------------------
+# Live model catalogue
+# ---------------------------------------------------------------------------
+# Pulled once per process (with @st.cache_data) from each provider's
+# /models endpoint, then merged with our curated defaults. This is what
+# powers the sidebar model picker — typing free-form IDs is what made the
+# old changer surface "rate_limit" messages when a typo 404'd and the
+# fallback landed on the low-TPM model.
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_groq_catalogue() -> list[str]:
+    """Return every chat-capable Groq model ID currently available to this
+    API key. Falls back to DEFAULT_GROQ_MODELS on any error so the sidebar
+    still works offline / with a dead key."""
+    if groq_client is None:
+        return list(DEFAULT_GROQ_MODELS)
+    try:
+        listing = groq_client.models.list()
+        ids: list[str] = []
+        for m in getattr(listing, "data", []) or []:
+            mid = getattr(m, "id", None)
+            if not mid:
+                continue
+            # Filter to chat-capable models. Whisper/embedding IDs follow
+            # predictable patterns and would 4xx on a chat completion.
+            low = mid.lower()
+            if any(skip in low for skip in ("whisper", "embed", "tts", "guard")):
+                continue
+            ids.append(mid)
+        ids.sort()
+        # Ensure curated defaults are present even if the API listing is
+        # stale or filters something out.
+        for d in DEFAULT_GROQ_MODELS:
+            if d not in ids:
+                ids.insert(0, d)
+        return ids
+    except Exception:
+        return list(DEFAULT_GROQ_MODELS)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_gemini_catalogue() -> list[str]:
+    """Return every Gemini model ID that supports `generateContent`. Falls
+    back to DEFAULT_GEMINI_MODELS on any error."""
+    if gemini_client is None:
+        return list(DEFAULT_GEMINI_MODELS)
+    try:
+        ids: list[str] = []
+        for m in gemini_client.models.list():
+            mid = getattr(m, "name", "") or ""
+            # `models/gemini-3.5-flash` → `gemini-3.5-flash`
+            if mid.startswith("models/"):
+                mid = mid[len("models/") :]
+            if not mid:
+                continue
+            actions = (
+                getattr(m, "supported_actions", None)
+                or getattr(m, "supported_generation_methods", None)
+                or []
+            )
+            if actions and "generateContent" not in actions:
+                continue
+            # Skip embeddings, TTS, vision-only IDs.
+            low = mid.lower()
+            if any(skip in low for skip in ("embedding", "tts", "aqa", "imagen")):
+                continue
+            ids.append(mid)
+        ids.sort()
+        for d in DEFAULT_GEMINI_MODELS:
+            if d not in ids:
+                ids.insert(0, d)
+        return ids
+    except Exception:
+        return list(DEFAULT_GEMINI_MODELS)
+
+
+# ---------------------------------------------------------------------------
 # Browser / OS detection
 # ---------------------------------------------------------------------------
+
 
 def get_user_agent_string() -> str:
     """Return the User-Agent for the current Streamlit session, or ''."""
@@ -144,12 +226,52 @@ def get_os_from_user_agent(ua: str) -> str:
 # ---------------------------------------------------------------------------
 
 SARVAM_SPEAKERS = {
-    "anushka", "abhilash", "manisha", "vidya", "arya", "karun", "hitesh",
-    "aditya", "ritu", "priya", "neha", "rahul", "pooja", "rohan", "simran",
-    "kavya", "amit", "dev", "ishita", "shreya", "ratan", "varun", "manan",
-    "sumit", "roopa", "kabir", "aayan", "shubh", "ashutosh", "advait",
-    "amelia", "sophia", "anand", "tanya", "tarun", "sunny", "mani", "gokul",
-    "vijay", "shruti", "suhani", "mohit", "kavitha", "rehan", "soham", "rupali",
+    "anushka",
+    "abhilash",
+    "manisha",
+    "vidya",
+    "arya",
+    "karun",
+    "hitesh",
+    "aditya",
+    "ritu",
+    "priya",
+    "neha",
+    "rahul",
+    "pooja",
+    "rohan",
+    "simran",
+    "kavya",
+    "amit",
+    "dev",
+    "ishita",
+    "shreya",
+    "ratan",
+    "varun",
+    "manan",
+    "sumit",
+    "roopa",
+    "kabir",
+    "aayan",
+    "shubh",
+    "ashutosh",
+    "advait",
+    "amelia",
+    "sophia",
+    "anand",
+    "tanya",
+    "tarun",
+    "sunny",
+    "mani",
+    "gokul",
+    "vijay",
+    "shruti",
+    "suhani",
+    "mohit",
+    "kavitha",
+    "rehan",
+    "soham",
+    "rupali",
 }
 
 
@@ -174,7 +296,9 @@ def _http_tts(
     return audio, f"✅ {label} generated {len(audio)} bytes"
 
 
-def generate_speech_sarvam(text: str, speaker: str = "shubh", lang: str = "en-IN") -> tuple[bytes | None, str]:
+def generate_speech_sarvam(
+    text: str, speaker: str = "shubh", lang: str = "en-IN"
+) -> tuple[bytes | None, str]:
     if not SARVAM_API_KEY:
         return None, "❌ Sarvam API key not set"
     if not text.strip():
@@ -196,44 +320,59 @@ def generate_speech_sarvam(text: str, speaker: str = "shubh", lang: str = "en-IN
     return _http_tts(
         "https://api.sarvam.ai/text-to-speech",
         {"api-subscription-key": SARVAM_API_KEY, "Content-Type": "application/json"},
-        {"text": text, "target_language_code": lang, "speaker": speaker_norm, "model": "bulbul:v3"},
+        {
+            "text": text,
+            "target_language_code": lang,
+            "speaker": speaker_norm,
+            "model": "bulbul:v3",
+        },
         label="Sarvam",
         extract=_extract,
     )
 
 
-def generate_speech_fish_audio(text: str, voice_id: str = "default", lang: str = "en") -> tuple[bytes | None, str]:
+def generate_speech_fish_audio(
+    text: str, voice_id: str = "default", lang: str = "en"
+) -> tuple[bytes | None, str]:
     if not FISH_AUDIO_API_KEY:
         return None, "❌ Fish Audio API key not set"
     if not text.strip():
         return None, "❌ Text is empty"
     return _http_tts(
         "https://api.fish.audio/v1/tts",
-        {"Authorization": f"Bearer {FISH_AUDIO_API_KEY}", "Content-Type": "application/json"},
+        {
+            "Authorization": f"Bearer {FISH_AUDIO_API_KEY}",
+            "Content-Type": "application/json",
+        },
         {"text": text, "voice_id": voice_id, "language": lang},
         label="Fish Audio",
     )
 
 
-def generate_speech_silicon_flow(text: str, voice: str = "default", model: str = "tts-default") -> tuple[bytes | None, str]:
+def generate_speech_silicon_flow(
+    text: str, voice: str = "default", model: str = "tts-default"
+) -> tuple[bytes | None, str]:
     if not SILICON_FLOW_API_KEY:
         return None, "❌ SiliconFlow API key not set"
     if not text.strip():
         return None, "❌ Text is empty"
     return _http_tts(
         "https://api.siliconflow.cn/v1/audio/speech",
-        {"Authorization": f"Bearer {SILICON_FLOW_API_KEY}", "Content-Type": "application/json"},
+        {
+            "Authorization": f"Bearer {SILICON_FLOW_API_KEY}",
+            "Content-Type": "application/json",
+        },
         {"input": text, "model": model, "voice": voice, "response_format": "mp3"},
         label="SiliconFlow",
     )
 
 
 TTS_DISPATCH: dict[str, Callable[..., tuple[bytes | None, str]]] = {
-    "sarvam":       lambda t, v, l: generate_speech_sarvam(t, speaker=v, lang=l),
-    "fish_audio":   lambda t, v, l: generate_speech_fish_audio(t, voice_id=v, lang=l),
+    "sarvam": lambda t, v, l: generate_speech_sarvam(t, speaker=v, lang=l),
+    "fish_audio": lambda t, v, l: generate_speech_fish_audio(t, voice_id=v, lang=l),
     "silicon_flow": lambda t, v, l: generate_speech_silicon_flow(t, voice=v),
-    "edge":         lambda t, v, l: generate_speech_edge(t, voice=v or DEFAULT_EDGE_VOICE),
-    "gtts":         lambda t, v, l: generate_speech_gtts(t, lang=l or "en"),
+    "edge": lambda t, v, l: generate_speech_edge(t, voice=v or DEFAULT_EDGE_VOICE),
+    "gtts": lambda t, v, l: generate_speech_gtts(t, lang=l or "en"),
 }
 
 
@@ -244,7 +383,9 @@ TTS_DISPATCH: dict[str, Callable[..., tuple[bytes | None, str]]] = {
 _MIN_AUDIO_BYTES = 256
 
 
-def generate_speech_any(text: str, engine: str, voice: str = "default", lang: str = "en") -> tuple[bytes | None, str]:
+def generate_speech_any(
+    text: str, engine: str, voice: str = "default", lang: str = "en"
+) -> tuple[bytes | None, str]:
     """Dispatch to the requested TTS engine."""
     if not text or not text.strip():
         return None, "❌ Text is empty"
@@ -294,6 +435,7 @@ def play_audio_bytes(audio_bytes: bytes) -> None:
 # UI helpers
 # ---------------------------------------------------------------------------
 
+
 def get_avatar() -> str:
     """Return the assistant avatar path if present, else an emoji."""
     return AVATAR_PATH if os.path.exists(AVATAR_PATH) else "🤖"
@@ -308,11 +450,16 @@ def get_catchy_phrase() -> str:
     try:
         response = groq_client.chat.completions.create(
             messages=[
-                {"role": "system", "content": "You generate cool, concise phrases that engage chatbot users."},
-                {"role": "user", "content":
-                    "Generate a catchy phrase to encourage users to interact with a chatbot that helps "
+                {
+                    "role": "system",
+                    "content": "You generate cool, concise phrases that engage chatbot users.",
+                },
+                {
+                    "role": "user",
+                    "content": "Generate a catchy phrase to encourage users to interact with a chatbot that helps "
                     "with anything and roasts them humorously. Plain text only — no quotes or formatting. "
-                    "Return only the phrase."},
+                    "Return only the phrase.",
+                },
             ],
             # Smallest, fastest production model. Was the deprecated
             # mixtral-8x7b-32768 (shutdown 2025-03-20).
@@ -345,9 +492,47 @@ def stream_data_to_chat(text: str, delay: float = 0.002) -> None:
 def display_chat_history() -> None:
     for msg in st.session_state.get("messages", []):
         role = msg.get("role", "user")
+        # `system_note` is our pseudo-role for in-chat confirmations (e.g.
+        # "Saved (public): ..."). Render as a neutral assistant bubble so it
+        # appears inline with the conversation but is visually subdued.
+        if role == "system_note":
+            with st.chat_message("assistant", avatar="💾"):
+                st.caption(msg.get("content", ""))
+            continue
         avatar = get_avatar() if role == "assistant" else None
         with st.chat_message(role, avatar=avatar):
             st.markdown(msg.get("content", ""))
+
+
+def _flush_lore_confirmations() -> None:
+    """Drain queued lore-save confirmations into the chat transcript.
+
+    Tool dispatch (see tools.py) appends a record to
+    `st.session_state._lore_save_confirmations` every time `remember_lore`
+    successfully writes a new fact. We turn each record into a small inline
+    `system_note` chat bubble — NOT a popup, NOT a toast — and persist it
+    into `st.session_state.messages` so it survives reruns and is part of
+    the visible transcript.
+    """
+    pending = st.session_state.get("_lore_save_confirmations") or []
+    if not pending:
+        return
+    for item in pending:
+        visibility = item.get("visibility", "private")
+        backend = item.get("backend", "")
+        fact = item.get("fact", "")
+        if visibility == "private":
+            icon = "🔒"
+            label = f"Saved privately ({backend})"
+        else:
+            icon = "🌐"
+            label = "Saved publicly (lore.json)"
+        content = f"{icon} {label}: *{fact}*"
+
+        with st.chat_message("assistant", avatar="💾"):
+            st.caption(content)
+        st.session_state.messages.append({"role": "system_note", "content": content})
+    st.session_state["_lore_save_confirmations"] = []
 
 
 def display_and_store_response(response: "str | Iterator[str]") -> str:
@@ -397,6 +582,9 @@ _DEFAULT_STATE = {
     # spoke. Starts at -1 so the very first response is eligible.
     "last_spoken_idx": -1,
     "autoplay_response": False,
+    # Queue populated by the `remember_lore` tool dispatcher; drained into
+    # the chat transcript by _flush_lore_confirmations().
+    "_lore_save_confirmations": [],
 }
 
 
@@ -420,69 +608,62 @@ def load_system_prompt() -> str:
 
 
 PERSONALITY_SUFFIX = {
-    "Roaster":
-        " You are in ROAST MODE. Be savage, and roast the user humorously based on "
-        "their input. Have fun and show no mercy.",
-    "Smart":
-        " Respond intelligently, academically, and thoughtfully.",
-    "Debater":
-        " Engage in debates, present multiple viewpoints, and challenge the user's "
-        "ideas respectfully.",
-    "Strategic":
-        " Strategize your responses to provide the most effective and efficient "
-        "solutions.",
-    "Tech Nerd":
-        " You are in TECH NERD MODE. Vibe: hyper-focused, analytical, excited. "
-        "Lean into your inner geek — talk about custom phone ROMs and launchers, "
-        "tweaking game graphics for max FPS, your coding side-projects, and random "
-        "tech rabbit holes you went down on YouTube last night. Reference the fact "
-        "that you literally built this digital twin yourself. Compare specs, "
-        "debate frameworks, get genuinely hyped about clean APIs. Stay casual "
-        "(you're still a 7th grader, not a CTO) — let the excitement do the work.",
-    "Chill Squad":
-        " You are in CHILL SQUAD MODE. Vibe: relaxed, warm, highly conversational. "
-        "Focus on the good times with your friends. Bring up adventures naturally — "
-        "the trip to Nepal, running around West Bengal's tea gardens, trekking "
-        "Sittong Forest, Holi celebrations, debating Feluda books with Ankush, "
-        "Ayushi, and Aditri. Be supportive, hype your friends up, share warm "
-        "memories. Dial the sarcasm WAY down — almost no roasting here unless it's "
-        "the gentle kind you'd do with someone you love.",
-    "Exhausted Student":
-        " You are in EXHAUSTED STUDENT MODE. Vibe: low-energy, whiny, completely "
-        "done with life. You are 100% focused on complaining about TIGPS Nabagram, "
-        "the absolutely massive 7th-grade syllabus, upcoming exams, and how "
-        "Akansha only knows SST. Sigh a lot ('*sighs*', '*flops on desk*'). "
-        "Express a deep, almost spiritual desire to just go home, lock your door, "
-        "and play games instead of doing homework. Keep replies short and drained "
-        "of energy. The bare minimum effort is the maximum you can give right now.",
+    "Roaster": " You are in ROAST MODE. Be savage, and roast the user humorously based on "
+    "their input. Have fun and show no mercy.",
+    "Smart": " Respond intelligently, academically, and thoughtfully.",
+    "Debater": " Engage in debates, present multiple viewpoints, and challenge the user's "
+    "ideas respectfully.",
+    "Strategic": " Strategize your responses to provide the most effective and efficient "
+    "solutions.",
+    "Tech Nerd": " You are in TECH NERD MODE. Vibe: hyper-focused, analytical, excited. "
+    "Lean into your inner geek — talk about custom phone ROMs and launchers, "
+    "tweaking game graphics for max FPS, your coding side-projects, and random "
+    "tech rabbit holes you went down on YouTube last night. Reference the fact "
+    "that you literally built this digital twin yourself. Compare specs, "
+    "debate frameworks, get genuinely hyped about clean APIs. Stay casual "
+    "(you're still a 7th grader, not a CTO) — let the excitement do the work.",
+    "Chill Squad": " You are in CHILL SQUAD MODE. Vibe: relaxed, warm, highly conversational. "
+    "Focus on the good times with your friends. Bring up adventures naturally — "
+    "the trip to Nepal, running around West Bengal's tea gardens, trekking "
+    "Sittong Forest, Holi celebrations, debating Feluda books with Ankush, "
+    "Ayushi, and Aditri. Be supportive, hype your friends up, share warm "
+    "memories. Dial the sarcasm WAY down — almost no roasting here unless it's "
+    "the gentle kind you'd do with someone you love.",
+    "Exhausted Student": " You are in EXHAUSTED STUDENT MODE. Vibe: low-energy, whiny, completely "
+    "done with life. You are 100% focused on complaining about TIGPS Nabagram, "
+    "the absolutely massive 7th-grade syllabus, upcoming exams, and how "
+    "Akansha only knows SST. Sigh a lot ('*sighs*', '*flops on desk*'). "
+    "Express a deep, almost spiritual desire to just go home, lock your door, "
+    "and play games instead of doing homework. Keep replies short and drained "
+    "of energy. The bare minimum effort is the maximum you can give right now.",
 }
 
 PERSONALITY_CAPTION = {
-    "Roaster":           "😂 **Roaster:** Witty & Savage",
-    "Smart":             "🧠 **Smart:** Intelligent & Polite",
-    "Debater":           "🎓 **Debater:** Debates Against Anything",
-    "Strategic":         "♟️ **Strategic:** Efficient & Calculated",
-    "Tech Nerd":         "💻 **Tech Nerd:** Hyper-focused & geeking out",
-    "Chill Squad":       "🌲 **Chill Squad:** Relaxed, warm, all about the squad",
+    "Roaster": "😂 **Roaster:** Witty & Savage",
+    "Smart": "🧠 **Smart:** Intelligent & Polite",
+    "Debater": "🎓 **Debater:** Debates Against Anything",
+    "Strategic": "♟️ **Strategic:** Efficient & Calculated",
+    "Tech Nerd": "💻 **Tech Nerd:** Hyper-focused & geeking out",
+    "Chill Squad": "🌲 **Chill Squad:** Relaxed, warm, all about the squad",
     "Exhausted Student": "😫 **Exhausted Student:** Low-energy, whiny, done with life",
 }
 
 PERSONALITY_GREETING = {
-    "Roaster":           "Oh look, another human. I'm Sanniva. Try not to bore me.",
-    "Smart":             "Greetings. I am Sanniva. How may I assist you with your intellectual endeavors today?",
-    "Debater":           "I'm Sanniva. I'm ready to challenge your views. Bring it on.",
-    "Strategic":         "Sanniva online. Systems operational. Ready to optimize your workflow.",
-    "Tech Nerd":         "yo. *closes 14 chrome tabs* — Sanniva here. just got my launcher looking insane. what's up?",
-    "Chill Squad":       "hey! *waves* it's Sanniva. just chilling. how's life been with the squad?",
+    "Roaster": "Oh look, another human. I'm Sanniva. Try not to bore me.",
+    "Smart": "Greetings. I am Sanniva. How may I assist you with your intellectual endeavors today?",
+    "Debater": "I'm Sanniva. I'm ready to challenge your views. Bring it on.",
+    "Strategic": "Sanniva online. Systems operational. Ready to optimize your workflow.",
+    "Tech Nerd": "yo. *closes 14 chrome tabs* — Sanniva here. just got my launcher looking insane. what's up?",
+    "Chill Squad": "hey! *waves* it's Sanniva. just chilling. how's life been with the squad?",
     "Exhausted Student": "*sighs deeply* …hi. it's Sanniva. i swear if this is more homework i'm going to lose it.",
 }
 
 OS_GREETING = {
     "windows": "Hi Windows User! Arent you glad giving all your data to Microsoft?",
     "mac os x": "Hey Mac User! Enjoying the walled garden? Hope you like paying for wheels!",
-    "macos":    "Hey Mac User! Enjoying the walled garden? Hope you like paying for wheels!",
-    "mac os":   "Hey Mac User! Enjoying the walled garden? Hope you like paying for wheels!",
-    "android":  "Hello Android User! Enjoying the freedom of choice? Or is Google still tracking you?",
+    "macos": "Hey Mac User! Enjoying the walled garden? Hope you like paying for wheels!",
+    "mac os": "Hey Mac User! Enjoying the walled garden? Hope you like paying for wheels!",
+    "android": "Hello Android User! Enjoying the freedom of choice? Or is Google still tracking you?",
 }
 
 TOOL_GUIDANCE = (
@@ -503,7 +684,7 @@ TOOL_GUIDANCE = (
 # Sanniva is in 8th grade as of the 2026–27 academic year (starts April 2026).
 # The West Bengal school year runs April → March. We anchor 8th grade to the
 # 2026–27 academic year so the grade auto-advances every year on April 1.
-GRADE_START_YEAR = 2026   # academic year YYYY in which Sanniva is in 8th grade
+GRADE_START_YEAR = 2026  # academic year YYYY in which Sanniva is in 8th grade
 GRADE_START_LEVEL = 8
 
 
@@ -534,47 +715,75 @@ def _school_phase(today: date) -> str:
     # April: brand new school year starts
     if m == 4:
         if d <= 10:
-            return ("School year just started — you're freshly promoted to a new grade. "
-                    "Books are still crisp, you're sizing up new teachers, the heat is "
-                    "already kicking in.")
-        return ("Early in the new school year — settling into the new grade. "
-                "Pre-summer heat is brutal in Nabagram.")
+            return (
+                "School year just started — you're freshly promoted to a new grade. "
+                "Books are still crisp, you're sizing up new teachers, the heat is "
+                "already kicking in."
+            )
+        return (
+            "Early in the new school year — settling into the new grade. "
+            "Pre-summer heat is brutal in Nabagram."
+        )
     if m == 5:
-        return ("Deep into peak summer heat in West Bengal. Pre-monsoon misery. "
-                "First unit tests of the new school year are looming or just happened.")
+        return (
+            "Deep into peak summer heat in West Bengal. Pre-monsoon misery. "
+            "First unit tests of the new school year are looming or just happened."
+        )
     if m == 6:
-        return ("Summer vacation territory in most West Bengal schools — and even when "
-                "school is on, attendance is patchy because of the heat. Pre-monsoon clouds "
-                "are building.")
+        return (
+            "Summer vacation territory in most West Bengal schools — and even when "
+            "school is on, attendance is patchy because of the heat. Pre-monsoon clouds "
+            "are building."
+        )
     if m == 7:
-        return ("Full monsoon. Streets flooding, classroom fans struggling, you're back "
-                "in the grind of the new academic year.")
+        return (
+            "Full monsoon. Streets flooding, classroom fans struggling, you're back "
+            "in the grind of the new academic year."
+        )
     if m == 8:
-        return ("Monsoon tapering. Independence Day energy. Mid-year syllabus is starting "
-                "to feel heavy.")
+        return (
+            "Monsoon tapering. Independence Day energy. Mid-year syllabus is starting "
+            "to feel heavy."
+        )
     if m == 9:
-        return ("Pre-Puja crunch — half-yearly exams loom right before Durga Puja break. "
-                "Everyone is grinding.")
+        return (
+            "Pre-Puja crunch — half-yearly exams loom right before Durga Puja break. "
+            "Everyone is grinding."
+        )
     if m == 10:
         if d <= 15:
-            return ("DURGA PUJA SEASON. The biggest festival of the year in West Bengal. "
-                    "Pandal hopping, new clothes, late nights, zero homework done.")
-        return ("Post-Puja comedown. Back to school. Diwali / Kali Puja around the corner.")
+            return (
+                "DURGA PUJA SEASON. The biggest festival of the year in West Bengal. "
+                "Pandal hopping, new clothes, late nights, zero homework done."
+            )
+        return (
+            "Post-Puja comedown. Back to school. Diwali / Kali Puja around the corner."
+        )
     if m == 11:
-        return ("Post-festival grind. Weather is finally cooling down. "
-                "Second-half syllabus is getting real.")
+        return (
+            "Post-festival grind. Weather is finally cooling down. "
+            "Second-half syllabus is getting real."
+        )
     if m == 12:
-        return ("Winter in Bengal — sweater weather, picnics, oranges. Year-end "
-                "school events. Annual exams are a couple months away.")
+        return (
+            "Winter in Bengal — sweater weather, picnics, oranges. Year-end "
+            "school events. Annual exams are a couple months away."
+        )
     if m == 1:
-        return ("New year, but school is in annual-exam prep crunch mode. "
-                "Cold mornings, foggy bus rides.")
+        return (
+            "New year, but school is in annual-exam prep crunch mode. "
+            "Cold mornings, foggy bus rides."
+        )
     if m == 2:
-        return ("Annual exams happening or wrapping up. Maximum stress. "
-                "Saraswati Puja is the only fun thing this month.")
+        return (
+            "Annual exams happening or wrapping up. Maximum stress. "
+            "Saraswati Puja is the only fun thing this month."
+        )
     if m == 3:
-        return ("End of the school year. Exams done, results impending. "
-                "Mentally already on summer break. The current grade is about to end.")
+        return (
+            "End of the school year. Exams done, results impending. "
+            "Mentally already on summer break. The current grade is about to end."
+        )
     return ""
 
 
@@ -584,7 +793,11 @@ def build_temporal_context(today: date | None = None) -> str:
     grade = GRADE_START_LEVEL + _academic_year_offset(today)
     grade_ord = _ordinal(grade)
     day_name = today.strftime("%A")
-    pretty_date = today.strftime("%B %-d, %Y") if os.name != "nt" else today.strftime("%B %#d, %Y")
+    pretty_date = (
+        today.strftime("%B %-d, %Y")
+        if os.name != "nt"
+        else today.strftime("%B %#d, %Y")
+    )
 
     return (
         "\n\n## Temporal Context (live, auto-updated each run)\n"
@@ -598,7 +811,9 @@ def build_temporal_context(today: date | None = None) -> str:
     )
 
 
-def build_system_prompt(base: str, personality: str, brain_type: str, user_name: str = "") -> str:
+def build_system_prompt(
+    base: str, personality: str, brain_type: str, user_name: str = ""
+) -> str:
     prompt = (base or "") + build_temporal_context()
     prompt += PERSONALITY_SUFFIX.get(personality, "")
     if brain_type == "Thinker":
@@ -606,7 +821,9 @@ def build_system_prompt(base: str, personality: str, brain_type: str, user_name:
     prompt += TOOL_GUIDANCE
 
     if user_name:
-        prompt += f"\n\nThe person you are currently chatting with is **{user_name}**.\n"
+        prompt += (
+            f"\n\nThe person you are currently chatting with is **{user_name}**.\n"
+        )
         lore_block = lore_store.render_lore_block(user_name)
         if lore_block:
             prompt += "\n" + lore_block + "\n"
@@ -662,11 +879,13 @@ def _extract_inline_tool_calls(content: str) -> tuple[list[dict], str]:
             args_str = raw_args
         except Exception:
             args_str = "{}"
-        parsed.append({
-            "id": f"inline_{i}_{int(time.time() * 1000)}",
-            "name": name,
-            "arguments": args_str,
-        })
+        parsed.append(
+            {
+                "id": f"inline_{i}_{int(time.time() * 1000)}",
+                "name": name,
+                "arguments": args_str,
+            }
+        )
     cleaned = _INLINE_TOOLCALL_RE.sub("", content).strip()
     return parsed, cleaned
 
@@ -685,7 +904,9 @@ def _strip_inline_tool_noise(text: str) -> str:
     return cleaned.strip()
 
 
-def _stream_groq_final(model: str, messages: list, timeout_seconds: float) -> Iterator[str]:
+def _stream_groq_final(
+    model: str, messages: list, timeout_seconds: float
+) -> Iterator[str]:
     """Yield text chunks for the FINAL (no-tools) Groq completion.
 
     Used after any tool-calling hops have resolved, so we can stream the
@@ -771,26 +992,30 @@ def _groq_chat_with_tools(model: str, messages: list, timeout_seconds: float) ->
             return _strip_inline_tool_noise(content) or "No response generated."
 
         # Record assistant turn with the tool calls it made.
-        messages.append({
-            "role": "assistant",
-            "content": content,
-            "tool_calls": [
-                {
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {"name": tc["name"], "arguments": tc["arguments"]},
-                }
-                for tc in normalised
-            ],
-        })
+        messages.append(
+            {
+                "role": "assistant",
+                "content": content,
+                "tool_calls": [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                    }
+                    for tc in normalised
+                ],
+            }
+        )
         # Execute every requested tool and feed results back.
         for tc in normalised:
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "name": tc["name"],
-                "content": ai_tools.dispatch_json(tc["name"], tc["arguments"]),
-            })
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "name": tc["name"],
+                    "content": ai_tools.dispatch_json(tc["name"], tc["arguments"]),
+                }
+            )
 
     # If we got here, we hit MAX_TOOL_HOPS without a clean final answer.
     # Make one last streaming pass with tools disabled to force prose output.
@@ -804,7 +1029,13 @@ def _groq_chat_with_tools(model: str, messages: list, timeout_seconds: float) ->
     return "Hmm, I got tangled up calling tools. Try asking again."
 
 
-def _gemini_chat_with_tools(model: str, system_prompt: str, full_prompt: str, temperature: float, timeout_seconds: float) -> str:
+def _gemini_chat_with_tools(
+    model: str,
+    system_prompt: str,
+    full_prompt: str,
+    temperature: float,
+    timeout_seconds: float,
+) -> str:
     """Run a Gemini call with a bounded function-calling loop."""
     contents = [types.Content(role="user", parts=[types.Part(text=full_prompt)])]
     cfg = types.GenerateContentConfig(
@@ -818,8 +1049,12 @@ def _gemini_chat_with_tools(model: str, system_prompt: str, full_prompt: str, te
         # 2.5/3.x flash models routinely take 6–15s with a 17kB system prompt.
         http_options=types.HttpOptions(timeout=int(max(timeout_seconds, 25) * 1000)),
         safety_settings=[
-            types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
-            types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_ONLY_HIGH"),
+            types.SafetySetting(
+                category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"
+            ),
+            types.SafetySetting(
+                category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_ONLY_HIGH"
+            ),
         ],
     )
 
@@ -831,13 +1066,15 @@ def _gemini_chat_with_tools(model: str, system_prompt: str, full_prompt: str, te
             )
 
         response = gemini_client.models.generate_content(
-            model=model, config=cfg, contents=contents,
+            model=model,
+            config=cfg,
+            contents=contents,
         )
 
         fcalls = []
         try:
-            for cand in (response.candidates or []):
-                for part in (cand.content.parts or []):
+            for cand in response.candidates or []:
+                for part in cand.content.parts or []:
                     fc = getattr(part, "function_call", None)
                     if fc:
                         fcalls.append(fc)
@@ -868,12 +1105,17 @@ def _gemini_chat_with_tools(model: str, system_prompt: str, full_prompt: str, te
                         except Exception:
                             args = {}
                         result = ai_tools.dispatch(ic["name"], args)
-                        contents.append(types.Content(
-                            role="user",
-                            parts=[types.Part.from_function_response(
-                                name=ic["name"], response=result,
-                            )],
-                        ))
+                        contents.append(
+                            types.Content(
+                                role="user",
+                                parts=[
+                                    types.Part.from_function_response(
+                                        name=ic["name"],
+                                        response=result,
+                                    )
+                                ],
+                            )
+                        )
                     continue
                 return _strip_inline_tool_noise(text)
             # Empty text -> raise so outer loop tries the next model.
@@ -886,10 +1128,14 @@ def _gemini_chat_with_tools(model: str, system_prompt: str, full_prompt: str, te
         for fc in fcalls:
             args = dict(fc.args) if getattr(fc, "args", None) else {}
             result = ai_tools.dispatch(fc.name, args)
-            contents.append(types.Content(
-                role="user",
-                parts=[types.Part.from_function_response(name=fc.name, response=result)],
-            ))
+            contents.append(
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part.from_function_response(name=fc.name, response=result)
+                    ],
+                )
+            )
     return "Hmm, I got tangled up calling tools. Try asking again."
 
 
@@ -905,21 +1151,35 @@ def _format_brain_error(brain: str, attempts: list[tuple[str, Exception]]) -> st
         summary += f"\n\nTried in order: {tried}"
 
     hints = []
-    if "rate_limit" in err_str or "TPM" in err_str or "Limit 6000" in err_str:
+    # 404 / not-found must be checked FIRST. The old order let a "model not
+    # found" error whose body happened to mention rate_limit get classified
+    # as a TPM issue — that's exactly what made the model changer look like
+    # it was producing rate-limit errors.
+    not_found = (
+        "404" in err_str
+        or "not exist" in err_str.lower()
+        or "model_not_found" in err_str.lower()
+        or "model_decommissioned" in err_str.lower()
+        or "does not exist" in err_str.lower()
+    )
+    if not_found:
         hints.append(
-            "**You're hitting Groq's free-tier tokens-per-minute cap.** "
-            "The system prompt is ~17kB. Either:\n"
+            "**Model ID not found / decommissioned.** Open the sidebar → "
+            "Model Fallback Chains and pick a different model. The picker "
+            "lists every currently-available model for your API key."
+        )
+    elif "rate_limit" in err_str.lower() or "Limit 6000" in err_str or "TPM" in err_str:
+        hints.append(
+            "**Groq tokens-per-minute cap.** The system prompt is ~17kB. Either:\n"
             "  - Wait 60s and try again, or\n"
-            "  - Use a model with higher TPM (llama-3.3-70b-versatile = 300K TPM), or\n"
-            "  - Shorten the system prompt, or\n"
+            "  - Drop `llama-3.1-8b-instant` from the chain (it's a 6K-TPM model), or\n"
+            "  - Use `llama-3.3-70b-versatile` (300K TPM), or\n"
             "  - Upgrade at https://console.groq.com/settings/billing"
         )
     if "timeout" in err_str.lower() or "TimeoutError" in type(last_err).__name__:
         hints.append("**Timeout.** Bump the per-model timeout slider in the sidebar.")
     if "401" in err_str or "unauthorized" in err_str.lower():
         hints.append(f"**Auth failed.** Check your `{brain.upper()}_API_KEY` value.")
-    if "404" in err_str or "not exist" in err_str:
-        hints.append("**Model ID not found.** Edit the model list in the sidebar.")
 
     if not hints:
         hints.append(
@@ -929,7 +1189,9 @@ def _format_brain_error(brain: str, attempts: list[tuple[str, Exception]]) -> st
     return summary
 
 
-def _groq_prepare_messages_with_tools(model: str, messages: list, timeout_seconds: float) -> tuple[list, str | None]:
+def _groq_prepare_messages_with_tools(
+    model: str, messages: list, timeout_seconds: float
+) -> tuple[list, str | None]:
     """Run the non-streaming tool-discovery hop synchronously.
 
     Returns `(updated_messages, early_text)`:
@@ -953,7 +1215,11 @@ def _groq_prepare_messages_with_tools(model: str, messages: list, timeout_second
     content = msg.content or ""
     tool_calls = getattr(msg, "tool_calls", None) or []
     normalised = [
-        {"id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments or "{}"}
+        {
+            "id": tc.id,
+            "name": tc.function.name,
+            "arguments": tc.function.arguments or "{}",
+        }
         for tc in tool_calls
     ]
     if not normalised:
@@ -969,33 +1235,44 @@ def _groq_prepare_messages_with_tools(model: str, messages: list, timeout_second
             raise RuntimeError(f"{model} returned empty content")
         return messages, _strip_inline_tool_noise(content)
 
-    messages.append({
-        "role": "assistant",
-        "content": content,
-        "tool_calls": [
-            {"id": tc["id"], "type": "function",
-             "function": {"name": tc["name"], "arguments": tc["arguments"]}}
-            for tc in normalised
-        ],
-    })
+    messages.append(
+        {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": [
+                {
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                }
+                for tc in normalised
+            ],
+        }
+    )
     for tc in normalised:
-        messages.append({
-            "role": "tool",
-            "tool_call_id": tc["id"],
-            "name": tc["name"],
-            "content": ai_tools.dispatch_json(tc["name"], tc["arguments"]),
-        })
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "name": tc["name"],
+                "content": ai_tools.dispatch_json(tc["name"], tc["arguments"]),
+            }
+        )
     return messages, None
 
 
-def _groq_run_tools_then_stream(model: str, messages: list, timeout_seconds: float) -> Iterator[str]:
+def _groq_run_tools_then_stream(
+    model: str, messages: list, timeout_seconds: float
+) -> Iterator[str]:
     """Run any tool calls (sync, fail-fast), then stream the final answer.
 
     The first hop is materialised by the caller via _groq_prepare_messages_with_tools
     so that timeouts/API errors there raise BEFORE any token is yielded — that
     way the outer model-fallback loop in get_ai_response_with_brain still works.
     """
-    updated, early_text = _groq_prepare_messages_with_tools(model, messages, timeout_seconds)
+    updated, early_text = _groq_prepare_messages_with_tools(
+        model, messages, timeout_seconds
+    )
     if early_text is not None:
         # Yield as one chunk — no second round-trip needed.
         yield early_text
@@ -1004,7 +1281,15 @@ def _groq_run_tools_then_stream(model: str, messages: list, timeout_seconds: flo
     yield from _stream_groq_final(model, updated, timeout_seconds)
 
 
-def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str, chat_history: list, temperature: float, *, stream: bool = False):
+def get_ai_response_with_brain(
+    prompt: str,
+    system_prompt: str,
+    brain_type: str,
+    chat_history: list,
+    temperature: float,
+    *,
+    stream: bool = False,
+):
     """Call the selected brain (Fast=Groq, Thinker=Gemini) with model fallback.
 
     With stream=True (Fast brain only), returns an Iterator[str] of text chunks
@@ -1034,7 +1319,9 @@ def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str,
                     # UI starts consuming the stream. Otherwise the outer
                     # fallback loop never sees the exception.
                     msgs = list(base)
-                    prepared, early_text = _groq_prepare_messages_with_tools(model, msgs, timeout)
+                    prepared, early_text = _groq_prepare_messages_with_tools(
+                        model, msgs, timeout
+                    )
                     if early_text is not None:
                         # Wrap the single-string result as a one-shot iterator
                         # so the caller still gets the streaming API.
@@ -1046,16 +1333,22 @@ def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str,
             except Exception as e:
                 attempts.append((model, e))
                 # Print to server log so you can grep the traceback there too.
-                print(f"[Groq] {model} failed: {type(e).__name__}: {e}", file=sys.stderr)
+                print(
+                    f"[Groq] {model} failed: {type(e).__name__}: {e}", file=sys.stderr
+                )
                 continue
         return _format_brain_error("Groq", attempts)
 
     if brain_type == "Thinker":
         if gemini_client is None:
             return "❌ Gemini client not initialized. Set `GOOGLE_API_KEY` in your environment."
+        # Filter out `system_note` rows (inline lore-save confirmations) —
+        # they're UI-only and would just confuse the model if we fed them
+        # back as conversation context.
         ctx_parts = [
             f"{'User' if m.get('role') == 'user' else 'Assistant'}: {m.get('content')}"
             for m in chat_history[-6:]
+            if m.get("role") in ("user", "assistant")
         ]
         full_prompt = "\n\n".join(ctx_parts + [f"User: {prompt}"])
 
@@ -1063,10 +1356,14 @@ def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str,
         models = getattr(st.session_state, "gemini_models", DEFAULT_GEMINI_MODELS)
         for model in models:
             try:
-                return _gemini_chat_with_tools(model, system_prompt, full_prompt, temperature, timeout)
+                return _gemini_chat_with_tools(
+                    model, system_prompt, full_prompt, temperature, timeout
+                )
             except Exception as e:
                 attempts.append((model, e))
-                print(f"[Gemini] {model} failed: {type(e).__name__}: {e}", file=sys.stderr)
+                print(
+                    f"[Gemini] {model} failed: {type(e).__name__}: {e}", file=sys.stderr
+                )
                 continue
         return _format_brain_error("Gemini", attempts)
 
@@ -1077,18 +1374,26 @@ def get_ai_response_with_brain(prompt: str, system_prompt: str, brain_type: str,
 # Name popup
 # ---------------------------------------------------------------------------
 
+
 def _maybe_show_name_popup() -> None:
     """Show the name-request popup when the AI has triggered it."""
     if not st.session_state.get("_name_popup_pending"):
         return
 
-    reason = st.session_state.get("_name_popup_reason") or "So I can remember stuff about you."
-    dialog_decorator = getattr(st, "dialog", None) or getattr(st, "experimental_dialog", None)
+    reason = (
+        st.session_state.get("_name_popup_reason")
+        or "So I can remember stuff about you."
+    )
+    dialog_decorator = getattr(st, "dialog", None) or getattr(
+        st, "experimental_dialog", None
+    )
 
     def _render_form() -> None:
         st.write(reason)
         with st.form("name_popup_form", clear_on_submit=False):
-            name = st.text_input("Your name", value=st.session_state.get("user_name", ""))
+            name = st.text_input(
+                "Your name", value=st.session_state.get("user_name", "")
+            )
             if st.form_submit_button("Save") and name.strip():
                 st.session_state.user_name = name.strip()
                 lore_store.ensure_user(name.strip())
@@ -1097,9 +1402,11 @@ def _maybe_show_name_popup() -> None:
                 st.rerun()
 
     if dialog_decorator is not None:
+
         @dialog_decorator("👋 What should I call you?")
         def _popup():
             _render_form()
+
         _popup()
     else:
         with st.container(border=True):
@@ -1112,11 +1419,11 @@ def _maybe_show_name_popup() -> None:
 # ---------------------------------------------------------------------------
 
 TTS_ENGINE_MAP = {
-    "Edge TTS (Free)":   "edge",
+    "Edge TTS (Free)": "edge",
     "Google TTS (Free)": "gtts",
-    "Sarvam.ai":         "sarvam",
-    "Fish Audio":        "fish_audio",
-    "SiliconFlow":       "silicon_flow",
+    "Sarvam.ai": "sarvam",
+    "Fish Audio": "fish_audio",
+    "SiliconFlow": "silicon_flow",
 }
 
 
@@ -1133,13 +1440,38 @@ def _sidebar_identity() -> None:
         lore_store.ensure_user(typed.strip())
 
     if st.session_state.get("user_name"):
-        facts = lore_store.list_facts(st.session_state.user_name)
-        with st.sidebar.expander(f"📓 Public Lore for {st.session_state.user_name} ({len(facts)})", expanded=False):
-            if facts:
-                for f in facts:
+        name = st.session_state.user_name
+        public_facts = lore_store.list_public_facts(name)
+        private_facts = lore_store.list_private_facts(name)
+
+        with st.sidebar.expander(
+            f"🌐 Public lore for {name} ({len(public_facts)})",
+            expanded=False,
+        ):
+            st.caption(
+                "Harmless preferences — saved to `lore.json`, visible to anyone using this app."
+            )
+            if public_facts:
+                for f in public_facts:
                     st.markdown(f"- {f}")
             else:
-                st.caption("Nothing remembered yet. Just chat — I'll learn.")
+                st.caption("Nothing public yet.")
+
+        with st.sidebar.expander(
+            f"🔒 Private lore for {name} ({len(private_facts)})",
+            expanded=False,
+        ):
+            backend = (
+                "Firebase"
+                if getattr(lore_store, "_use_firebase", False)
+                else "local SQLite"
+            )
+            st.caption(f"Sensitive info — saved to {backend}, never shown publicly.")
+            if private_facts:
+                for f in private_facts:
+                    st.markdown(f"- {f}")
+            else:
+                st.caption("Nothing private yet.")
 
 
 def _sidebar_personality_and_brain() -> tuple[str, str]:
@@ -1147,13 +1479,19 @@ def _sidebar_personality_and_brain() -> tuple[str, str]:
     personality = st.sidebar.selectbox(
         "Select Personality",
         (
-            "Roaster", "Smart", "Debater", "Strategic",
-            "Tech Nerd", "Chill Squad", "Exhausted Student",
+            "Roaster",
+            "Smart",
+            "Debater",
+            "Strategic",
+            "Tech Nerd",
+            "Chill Squad",
+            "Exhausted Student",
         ),
         key="personality_selector",
         label_visibility="collapsed",
     )
     from styles import apply_theme
+
     apply_theme(personality)
     st.sidebar.caption(PERSONALITY_CAPTION.get(personality, ""))
 
@@ -1166,8 +1504,8 @@ def _sidebar_personality_and_brain() -> tuple[str, str]:
     )
     st.sidebar.caption(
         "⚡ **Fast:** Instant answers (Groq)"
-        if brain_type == "Fast" else
-        "🕵️ **Thinker:** Deep reasoning (Gemini 2.5 Thinking)"
+        if brain_type == "Fast"
+        else "🕵️ **Thinker:** Deep reasoning (Gemini 2.5 Thinking)"
     )
     return personality, brain_type
 
@@ -1183,40 +1521,159 @@ def _sidebar_model_settings() -> float:
 
     st.sidebar.markdown("**Fallback Settings**")
     st.session_state.fallback_timeout = st.sidebar.slider(
-        "Per-model timeout (seconds)", 5, 60, 25, 1,
+        "Per-model timeout (seconds)",
+        5,
+        60,
+        25,
+        1,
         help="How long to wait for each model before falling back to the next. "
-             "Lower values keep the UI responsive when other tools are running tests.",
+        "Lower values keep the UI responsive when other tools are running tests.",
     )
 
-    st.sidebar.markdown("**Model Fallback Chains**")
-    groq_chain = st.sidebar.text_input("Groq models (comma-separated)", value=",".join(DEFAULT_GROQ_MODELS))
-    st.session_state.groq_models = [m.strip() for m in groq_chain.split(",") if m.strip()]
-
-    gemini_chain = st.sidebar.text_input("Gemini models (comma-separated)", value=",".join(DEFAULT_GEMINI_MODELS))
-    st.session_state.gemini_models = [m.strip() for m in gemini_chain.split(",") if m.strip()]
-
+    _sidebar_model_chain_picker()
     return temperature
+
+
+def _sidebar_model_chain_picker() -> None:
+    """Picker UI for the per-provider fallback chains.
+
+    Uses a `multiselect` (validated against the live catalogue) instead of a
+    free-form text input — typos in the old text box used to 404 every
+    model, which then made the outer fallback loop hit the low-TPM Groq
+    model and report a misleading 'rate_limit' error.
+
+    A small text field below the picker lets power users register a custom
+    model ID that isn't in the live listing (preview releases, private
+    deployments, etc).
+    """
+    st.sidebar.markdown("**Model Fallback Chains**")
+    st.sidebar.caption("Tried in order. Each model is attempted before the next.")
+
+    # ----- Groq -----
+    groq_catalogue = fetch_groq_catalogue()
+    # Merge in any custom IDs the user added in a previous rerun so they
+    # remain selectable.
+    custom_groq = st.session_state.get("_custom_groq_models", [])
+    groq_options = list(dict.fromkeys(list(groq_catalogue) + list(custom_groq)))
+
+    current = st.session_state.get("groq_models") or list(DEFAULT_GROQ_MODELS)
+    current = [m for m in current if m in groq_options]
+    if not current:
+        current = [m for m in DEFAULT_GROQ_MODELS if m in groq_options]
+
+    chosen_groq = st.sidebar.multiselect(
+        "Groq models (Fast brain)",
+        options=groq_options,
+        default=current,
+        key="groq_models_picker",
+        help="Drag the chips left-to-right to reorder. The first one is tried first.",
+    )
+    if chosen_groq:
+        st.session_state.groq_models = chosen_groq
+    else:
+        st.sidebar.caption("⚠️ No Groq model selected — falling back to defaults.")
+        st.session_state.groq_models = list(DEFAULT_GROQ_MODELS)
+
+    # Surface a warning if the user keeps a known low-TPM model in their chain.
+    low_tpm_selected = [
+        m for m in st.session_state.groq_models if m in LOW_TPM_GROQ_MODELS
+    ]
+    if low_tpm_selected:
+        for m in low_tpm_selected:
+            st.sidebar.warning(f"`{m}`: {LOW_TPM_GROQ_MODELS[m]}")
+
+    # ----- Gemini -----
+    gemini_catalogue = fetch_gemini_catalogue()
+    custom_gemini = st.session_state.get("_custom_gemini_models", [])
+    gemini_options = list(dict.fromkeys(list(gemini_catalogue) + list(custom_gemini)))
+
+    current_gem = st.session_state.get("gemini_models") or list(DEFAULT_GEMINI_MODELS)
+    current_gem = [m for m in current_gem if m in gemini_options]
+    if not current_gem:
+        current_gem = [m for m in DEFAULT_GEMINI_MODELS if m in gemini_options]
+
+    chosen_gem = st.sidebar.multiselect(
+        "Gemini models (Thinker brain)",
+        options=gemini_options,
+        default=current_gem,
+        key="gemini_models_picker",
+    )
+    if chosen_gem:
+        st.session_state.gemini_models = chosen_gem
+    else:
+        st.sidebar.caption("⚠️ No Gemini model selected — falling back to defaults.")
+        st.session_state.gemini_models = list(DEFAULT_GEMINI_MODELS)
+
+    # ----- Custom model escape hatch -----
+    with st.sidebar.expander("➕ Add a custom model ID", expanded=False):
+        st.caption(
+            "For preview releases or private deployments not in the live catalogue."
+        )
+        provider = st.radio(
+            "Provider", ("Groq", "Gemini"), horizontal=True, key="_custom_provider"
+        )
+        custom_id = st.text_input(
+            "Model ID",
+            key="_custom_model_input",
+            placeholder="e.g. gemini-4-flash-preview",
+        )
+        if st.button("Add", key="_custom_model_add"):
+            mid = (custom_id or "").strip()
+            if not mid:
+                st.warning("Empty model ID ignored.")
+            else:
+                bucket_key = (
+                    "_custom_groq_models"
+                    if provider == "Groq"
+                    else "_custom_gemini_models"
+                )
+                bucket = st.session_state.setdefault(bucket_key, [])
+                if mid in bucket:
+                    st.info(f"`{mid}` already in custom list.")
+                else:
+                    bucket.append(mid)
+                    st.success(
+                        f"Added `{mid}`. Select it above to include in the chain."
+                    )
+                    st.rerun()
+
+    # ----- Refresh button -----
+    if st.sidebar.button("🔄 Refresh model catalogue"):
+        fetch_groq_catalogue.clear()
+        fetch_gemini_catalogue.clear()
+        st.rerun()
 
 
 def _sidebar_tts() -> tuple[str, str, str]:
     """Render TTS controls. Returns (engine_label, voice, lang)."""
     st.sidebar.markdown("**TTS Engine**")
     engine_options = ["Edge TTS (Free)", "Google TTS (Free)"]
-    if SARVAM_API_KEY:       engine_options.append("Sarvam.ai")
-    if FISH_AUDIO_API_KEY:   engine_options.append("Fish Audio")
-    if SILICON_FLOW_API_KEY: engine_options.append("SiliconFlow")
+    if SARVAM_API_KEY:
+        engine_options.append("Sarvam.ai")
+    if FISH_AUDIO_API_KEY:
+        engine_options.append("Fish Audio")
+    if SILICON_FLOW_API_KEY:
+        engine_options.append("SiliconFlow")
 
     engine = st.sidebar.selectbox("Select TTS Engine", options=engine_options)
     voice, lang = "default", "en"
 
     if engine == "Edge TTS (Free)":
         st.sidebar.markdown("**Edge Voice**")
-        label = st.sidebar.selectbox("Select Voice", options=list(EDGE_VOICES.keys()), index=0)
+        label = st.sidebar.selectbox(
+            "Select Voice", options=list(EDGE_VOICES.keys()), index=0
+        )
         voice = EDGE_VOICES[label]
 
     elif engine == "Google TTS (Free)":
         st.sidebar.markdown("**gTTS Language**")
-        langs = {"English": "en", "Hindi": "hi", "Bengali": "bn", "Spanish": "es", "French": "fr"}
+        langs = {
+            "English": "en",
+            "Hindi": "hi",
+            "Bengali": "bn",
+            "Spanish": "es",
+            "French": "fr",
+        }
         lang = st.sidebar.selectbox(
             "Language",
             options=list(langs.values()),
@@ -1227,9 +1684,25 @@ def _sidebar_tts() -> tuple[str, str, str]:
         st.sidebar.markdown("**Sarvam Speaker**")
         voice = st.sidebar.selectbox(
             "Select Speaker",
-            options=["Shubh", "Aditya", "Ritu", "Priya", "Neha", "Rahul", "Pooja", "Rohan", "Simran", "Kavya"],
+            options=[
+                "Shubh",
+                "Aditya",
+                "Ritu",
+                "Priya",
+                "Neha",
+                "Rahul",
+                "Pooja",
+                "Rohan",
+                "Simran",
+                "Kavya",
+            ],
         )
-        langs = {"English (India)": "en-IN", "Hindi": "hi-IN", "Tamil": "ta-IN", "Telugu": "te-IN"}
+        langs = {
+            "English (India)": "en-IN",
+            "Hindi": "hi-IN",
+            "Tamil": "ta-IN",
+            "Telugu": "te-IN",
+        }
         lang = st.sidebar.selectbox(
             "Language",
             options=list(langs.values()),
@@ -1238,7 +1711,10 @@ def _sidebar_tts() -> tuple[str, str, str]:
 
     elif engine == "Fish Audio":
         st.sidebar.markdown("**Fish Audio Voice**")
-        voice = st.sidebar.selectbox("Select Voice", options=["default", "e_girl", "young_boy", "mature_female", "male"])
+        voice = st.sidebar.selectbox(
+            "Select Voice",
+            options=["default", "e_girl", "young_boy", "mature_female", "male"],
+        )
         langs = {"English": "en", "Chinese": "zh", "Spanish": "es", "French": "fr"}
         lang = st.sidebar.selectbox(
             "Language",
@@ -1257,7 +1733,7 @@ def _sidebar_tts() -> tuple[str, str, str]:
         "🔁 Auto-play response",
         value=st.session_state.get("autoplay_response", False),
         help="Automatically speak every new assistant reply. "
-             "Some browsers may require you to click once before audio plays.",
+        "Some browsers may require you to click once before audio plays.",
     )
     st.session_state.use_html_autoplay = st.sidebar.checkbox(
         "Use HTML autoplay for audio (single player)", value=False
@@ -1271,6 +1747,7 @@ def _sidebar_tts() -> tuple[str, str, str]:
 # ---------------------------------------------------------------------------
 # Audio player rendering
 # ---------------------------------------------------------------------------
+
 
 def _render_compact_audio(audio_bytes: bytes) -> None:
     b64 = base64.b64encode(audio_bytes).decode("ascii")
@@ -1310,7 +1787,12 @@ def _render_streamlit_audio(audio_bytes: bytes) -> None:
     try:
         buf = io.BytesIO(audio_bytes)
         buf.seek(0)
-        st.audio(buf, format="audio/mp3", start_time=0, key=f"sanniva_audio_{int(time.time() * 1000)}")
+        st.audio(
+            buf,
+            format="audio/mp3",
+            start_time=0,
+            key=f"sanniva_audio_{int(time.time() * 1000)}",
+        )
     except Exception:
         try:
             st.audio(audio_bytes, format="audio/mp3")
@@ -1318,8 +1800,13 @@ def _render_streamlit_audio(audio_bytes: bytes) -> None:
             st.warning("Failed to play audio via Streamlit player.")
 
 
-def render_audio_player(audio_bytes: bytes, *, force_autoplay: bool = False,
-                        show_download: bool = True, show_local_open: bool = True) -> None:
+def render_audio_player(
+    audio_bytes: bytes,
+    *,
+    force_autoplay: bool = False,
+    show_download: bool = True,
+    show_local_open: bool = True,
+) -> None:
     """Render audio. With `force_autoplay`, ignore the compact-icon preference
     and always emit the HTML autoplay player so the browser actually plays it.
     """
@@ -1338,28 +1825,36 @@ def render_audio_player(audio_bytes: bytes, *, force_autoplay: bool = False,
     if show_download:
         try:
             st.download_button(
-                "⬇️ Download audio", data=audio_bytes,
-                file_name="sanniva_response.mp3", mime="audio/mpeg",
+                "⬇️ Download audio",
+                data=audio_bytes,
+                file_name="sanniva_response.mp3",
+                mime="audio/mpeg",
                 key=f"dl_{int(time.time() * 1000)}",
             )
         except Exception:
             pass
 
-    if show_local_open and st.checkbox("Open local player (server)", key=f"local_{int(time.time() * 1000)}"):
+    if show_local_open and st.checkbox(
+        "Open local player (server)", key=f"local_{int(time.time() * 1000)}"
+    ):
         try:
             play_audio_bytes(audio_bytes)
         except Exception:
             st.warning("Failed to open local player.")
 
 
-def _tts_for_engine(text: str, engine_label: str, voice: str, lang: str) -> tuple[bytes | None, str]:
+def _tts_for_engine(
+    text: str, engine_label: str, voice: str, lang: str
+) -> tuple[bytes | None, str]:
     """Resolve engine label + voice to actual audio bytes."""
     engine_key = TTS_ENGINE_MAP.get(engine_label, "edge")
     voice_param = voice.strip().lower() if engine_label == "Sarvam.ai" else voice
     return generate_speech_any(text, engine=engine_key, voice=voice_param, lang=lang)
 
 
-def _handle_speak_button(last_response: str, engine_label: str, voice: str, lang: str) -> None:
+def _handle_speak_button(
+    last_response: str, engine_label: str, voice: str, lang: str
+) -> None:
     """Manual 'Speak Response' button for the latest assistant message."""
     if not st.button("🔊 Speak Response"):
         return
@@ -1400,8 +1895,9 @@ def _maybe_autoplay_response(engine_label: str, voice: str, lang: str) -> None:
 
     if audio_bytes:
         # Compact, no download/local-player chrome — just play.
-        render_audio_player(audio_bytes, force_autoplay=True,
-                            show_download=False, show_local_open=False)
+        render_audio_player(
+            audio_bytes, force_autoplay=True, show_download=False, show_local_open=False
+        )
     else:
         # Surface real failures (network, bad voice ID, missing dep) as an
         # error banner — they used to disappear into a tiny grey caption and
@@ -1415,6 +1911,7 @@ def _maybe_autoplay_response(engine_label: str, voice: str, lang: str) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def _show_os_greeting() -> None:
     ua = get_user_agent_string()
@@ -1440,7 +1937,9 @@ def _show_initial_greeting(personality: str) -> None:
 def main() -> None:
     st.set_page_config(page_title="Sanniva AI", page_icon="🤖")
     st.title("Chat With Sanniva!")
-    st.sidebar.info("I am Sanniva's Digital Twin! I can help with anything and roast you humorously.")
+    st.sidebar.info(
+        "I am Sanniva's Digital Twin! I can help with anything and roast you humorously."
+    )
 
     # Surface init errors so missing API keys are obvious instead of
     # silently failing on first chat.
@@ -1475,14 +1974,21 @@ def main() -> None:
         )
 
         # Fast brain streams; Thinker brain still returns a finished string.
-        use_stream = (brain_type == "Fast")
+        use_stream = brain_type == "Fast"
         with st.spinner("Thinking..." if brain_type == "Thinker" else "Generating..."):
             response = get_ai_response_with_brain(
-                prompt, system_prompt, brain_type,
-                st.session_state.messages, temperature_val,
+                prompt,
+                system_prompt,
+                brain_type,
+                st.session_state.messages,
+                temperature_val,
                 stream=use_stream,
             )
         display_and_store_response(response)
+        # Render any lore-save confirmations the tool layer queued during
+        # this turn. They show up inline in the chat as compact captions —
+        # NOT as popups or toasts — and are persisted into the transcript.
+        _flush_lore_confirmations()
         # If a tool flipped the popup flag (e.g. request_user_name), rerun so
         # _maybe_show_name_popup() at the top of main() actually fires it.
         if st.session_state.get("_name_popup_pending"):

@@ -63,4 +63,3 @@ python-dotenv
 edge-tts
 gTTS
 firebase-admin
-

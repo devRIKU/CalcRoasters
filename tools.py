@@ -56,7 +56,21 @@ OPENAI_TOOLS = [
                 "Save a fact about a specific user so you can recall it in future "
                 "conversations. Call this whenever the user shares something "
                 "memorable about themselves (likes, dislikes, family, hobbies, "
-                "etc.). Keep each fact short and concrete."
+                "etc.). Keep each fact short and concrete.\n\n"
+                "YOU MUST decide whether the fact is sensitive and set the "
+                "`private` flag accordingly:\n"
+                "  • `private: true`  → sensitive / personal info that should NOT "
+                "be visible to other users of this app. Examples: real address, "
+                "phone, email, school name combined with grade+location, mental "
+                "health, family conflict, religion, sexuality, romantic interests, "
+                "exam scores, salary, anything the user said 'don't tell anyone' "
+                "about. Saved to Firebase (or a local encrypted-style SQLite "
+                "fallback) — not shown in any public listing.\n"
+                "  • `private: false` → harmless preferences and trivia that are "
+                "fine to share publicly. Examples: favourite anime, favourite "
+                "food, hobbies, pets' names, favourite subject, music taste, "
+                "the fact that they own a bike. Saved to public lore.json.\n"
+                "When in doubt, prefer `private: true`."
             ),
             "parameters": {
                 "type": "object",
@@ -68,6 +82,15 @@ OPENAI_TOOLS = [
                     "fact": {
                         "type": "string",
                         "description": "Single concrete fact, e.g. 'Loves Demon Slayer'.",
+                    },
+                    "private": {
+                        "type": "boolean",
+                        "description": (
+                            "True if the fact is sensitive/personal (Firebase / "
+                            "private store). False if it's a harmless preference "
+                            "(public lore.json). Default: true (err on the side "
+                            "of privacy)."
+                        ),
                     },
                 },
                 "required": ["user_name", "fact"],
@@ -144,18 +167,52 @@ def dispatch(name: str, args: dict[str, Any]) -> dict[str, Any]:
             fact = (args.get("fact") or "").strip()
             if not user_name or not fact:
                 return {"ok": False, "error": "user_name and fact required"}
-            result = lore_store.add_fact(user_name, fact)
+            # Default to private when unspecified — safer than leaking sensitive
+            # info into public lore.json because the model forgot the flag.
+            private_raw = args.get("private")
+            if isinstance(private_raw, str):
+                private = private_raw.strip().lower() in ("true", "1", "yes", "y")
+            elif private_raw is None:
+                private = True
+            else:
+                private = bool(private_raw)
+
+            result = lore_store.add_fact(user_name, fact, private=private)
+            visibility = result.get("visibility", "private" if private else "public")
+            backend = result.get("backend", "")
+
+            # Queue an in-chat confirmation banner. The Streamlit layer drains
+            # this queue at the top of each render and prints the messages
+            # inline in the transcript — NOT as a popup/toast.
+            if result.get("ok") and not result.get("duplicate"):
+                pending = st.session_state.setdefault("_lore_save_confirmations", [])
+                pending.append({
+                    "user_name": user_name,
+                    "fact": fact,
+                    "visibility": visibility,
+                    "backend": backend,
+                })
+
             return {
                 "ok": result.get("ok", False),
                 "duplicate": result.get("duplicate", False),
+                "visibility": visibility,
+                "backend": backend,
                 "user_name": user_name,
                 "fact": fact,
             }
 
         if name == "recall_lore":
             user_name = (args.get("user_name") or "").strip()
-            facts = lore_store.list_facts(user_name)
-            return {"ok": True, "user_name": user_name, "facts": facts}
+            public = lore_store.list_public_facts(user_name)
+            private = lore_store.list_private_facts(user_name)
+            return {
+                "ok": True,
+                "user_name": user_name,
+                "facts": public + private,       # combined for convenience
+                "public_facts": public,
+                "private_facts": private,
+            }
 
         return {"ok": False, "error": f"unknown tool: {name}"}
     except Exception as e:

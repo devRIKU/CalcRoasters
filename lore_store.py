@@ -163,55 +163,103 @@ def ensure_user(name: str) -> dict[str, Any]:
         return db["users"][k]
 
 
-def add_fact(name: str, fact: str) -> dict[str, Any]:
-    """Append a fact to a user's lore in the private database (Firestore or SQLite fallback). Registers the user profile in lore.json if missing."""
-    if not name or not fact or not fact.strip():
-        return {"ok": False, "error": "name and fact required"}
+def _add_public_fact(name: str, fact_clean: str, now: int) -> bool:
+    """Append a fact to lore.json. Returns False if it was a duplicate."""
+    with _lock:
+        db = _load()
+        k = _key(name)
+        if k not in db["users"]:
+            db["users"][k] = {
+                "name": name.strip(),
+                "facts": [],
+                "first_seen": now,
+                "last_seen": now,
+            }
+        existing = {f.get("text", "").strip().lower() for f in db["users"][k]["facts"]}
+        if fact_clean.lower() in existing:
+            return False
+        db["users"][k]["facts"].append({"text": fact_clean, "ts": now})
+        db["users"][k]["last_seen"] = now
+        _save(db)
+        return True
 
-    # Ensure user profile exists in public lore (lore.json)
-    ensure_user(name)
+
+def _add_private_fact(name: str, fact_clean: str, now: int) -> tuple[bool, str]:
+    """Save a fact to the private store (Firestore preferred, SQLite fallback).
+
+    Returns (was_new, backend) where backend is 'firestore' or 'sqlite'.
+    """
     k = _key(name)
-    now = int(time.time())
-    fact_clean = fact.strip()
-
-    # Check for duplicate in public lore.json to avoid saving redundant facts
-    public_facts = {f.lower().strip() for f in list_public_facts(name)}
-    if fact_clean.lower() in public_facts:
-        return {"ok": True, "duplicate": True}
-
     if _use_firebase and _firestore_db is not None:
         try:
-            # Query all facts for user to check duplicate in Firestore
             docs = _firestore_db.collection("private_facts").where("user_key", "==", k).stream()
             for doc in docs:
                 if doc.to_dict().get("fact", "").strip().lower() == fact_clean.lower():
-                    return {"ok": True, "duplicate": True}
-            
-            # Insert new fact to Firebase Firestore
+                    return False, "firestore"
             _firestore_db.collection("private_facts").add({
                 "user_key": k,
                 "fact": fact_clean,
-                "ts": now
+                "ts": now,
             })
-            return {"ok": True, "duplicate": False}
+            return True, "firestore"
         except Exception as e:
             import sys
             sys.stderr.write(f"Firestore add_fact failed: {e}. Falling back to SQLite.\n")
 
-    # SQLite Fallback
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.execute(
             "SELECT 1 FROM private_facts WHERE user_key = ? AND LOWER(TRIM(fact)) = LOWER(TRIM(?)) LIMIT 1",
-            (k, fact_clean)
+            (k, fact_clean),
         )
         if cursor.fetchone():
-            return {"ok": True, "duplicate": True}
-
+            return False, "sqlite"
         conn.execute(
             "INSERT INTO private_facts (user_key, fact, ts) VALUES (?, ?, ?)",
-            (k, fact_clean, now)
+            (k, fact_clean, now),
         )
-    return {"ok": True, "duplicate": False}
+    return True, "sqlite"
+
+
+def add_fact(name: str, fact: str, *, private: bool = False) -> dict[str, Any]:
+    """Append a fact to a user's lore.
+
+    Args:
+        name: Display name of the user the fact is about.
+        fact: Short concrete fact text.
+        private: If True, save ONLY to the private store (Firestore → SQLite
+            fallback). If False, save ONLY to public lore.json. The AI is
+            responsible for picking which bucket each fact belongs in — see
+            the `remember_lore` tool description for the sensitivity rules.
+
+    Returns a dict with:
+        ok: bool
+        duplicate: bool  (True if the fact was already stored in the chosen bucket)
+        visibility: 'public' | 'private'
+        backend: 'lore.json' | 'firestore' | 'sqlite'
+    """
+    if not name or not fact or not fact.strip():
+        return {"ok": False, "error": "name and fact required"}
+
+    ensure_user(name)
+    now = int(time.time())
+    fact_clean = fact.strip()
+
+    if private:
+        was_new, backend = _add_private_fact(name, fact_clean, now)
+        return {
+            "ok": True,
+            "duplicate": not was_new,
+            "visibility": "private",
+            "backend": backend,
+        }
+
+    was_new = _add_public_fact(name, fact_clean, now)
+    return {
+        "ok": True,
+        "duplicate": not was_new,
+        "visibility": "public",
+        "backend": "lore.json",
+    }
 
 
 def list_public_facts(name: str) -> list[str]:
