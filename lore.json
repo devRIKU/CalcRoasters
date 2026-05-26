@@ -10,6 +10,17 @@
       ],
       "first_seen": 1779439077,
       "last_seen": 1779439306
+    },
+    "ankush": {
+      "name": "Ankush",
+      "facts": [
+        {
+          "text": "User's name is Ankush",
+          "ts": 1779811197
+        }
+      ],
+      "first_seen": 1779811030,
+      "last_seen": 1779811197
     }
   }
 }

@@ -22,6 +22,7 @@ from typing import Any, Callable, Iterator
 
 import requests
 import streamlit as st
+from streamlit.components.v1 import html as components_html
 from google import genai
 from google.genai import types
 from groq import Groq
@@ -188,6 +189,32 @@ def fetch_gemini_catalogue() -> list[str]:
         return ids
     except Exception:
         return list(DEFAULT_GEMINI_MODELS)
+
+
+@st.cache_resource(show_spinner=False)
+def get_gemini_tools_cached():
+    """Cached Gemini tool list.
+
+    `ai_tools.build_gemini_tools()` imports `google.genai.types` and rebuilds
+    a list of `FunctionDeclaration` objects on every brain call. That import
+    alone is non-trivial, and the resulting Tool object is identical across
+    calls (the schemas are module-level constants). Caching with
+    @st.cache_resource keeps it warm for the life of the process and lets
+    the Thinker path skip ~50–150 ms per turn — noticeable when a tool hop
+    happens inside a streaming response.
+    """
+    return ai_tools.build_gemini_tools()
+
+
+@st.cache_resource(show_spinner=False)
+def get_openai_tools_cached():
+    """Cached OpenAI / Groq tool schema list.
+
+    Already a module-level constant in `tools.py`, but caching the reference
+    means we go through `st.cache_resource`'s identity-stable handle — useful
+    if we later swap to dynamically-generated tools (e.g. per-personality).
+    """
+    return ai_tools.OPENAI_TOOLS
 
 
 # ---------------------------------------------------------------------------
@@ -504,6 +531,64 @@ def display_chat_history() -> None:
             st.markdown(msg.get("content", ""))
 
 
+# st.fragment lets a UI block rerun independently without reloading the
+# whole page. We use it for the lore-confirmation drainer and the name
+# popup so a fact-save click or a name submit doesn't trigger a full chat
+# rerender (which on slow networks was visibly redrawing every prior
+# message). Falls back to a no-op decorator on Streamlit < 1.33.
+_fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
+if _fragment is None:
+    def _fragment(fn=None, **_kw):
+        if fn is None:
+            return lambda f: f
+        return fn
+
+
+@_fragment
+def _render_tool_status_banner() -> None:
+    """Drain the cross-thread tool status queue and surface live activity.
+
+    Wrapped in @st.fragment so the banner can update on its own without
+    rerunning the whole script. The status events are pushed by
+    `tools.push_tool_status` from the dispatcher; this drainer keeps the
+    last ~5 events in session state and renders them as compact captions
+    above the chat input. Acts as the "optimistic update" — the banner
+    appears the moment a tool starts, before the LLM even continues
+    streaming its reply.
+    """
+    q = st.session_state.get("_tool_status_queue")
+    if q is None:
+        return
+    events: list[dict] = st.session_state.setdefault("_tool_status_log", [])
+    drained = False
+    try:
+        while True:
+            events.append(q.get_nowait())
+            drained = True
+    except Exception:
+        pass
+    if drained:
+        # Keep the log short so we don't grow the session unboundedly.
+        st.session_state["_tool_status_log"] = events[-5:]
+    if not events:
+        return
+
+    # Show the most recent event, with subdued styling.
+    last = events[-1]
+    ev = last.get("event")
+    tool = last.get("tool", "?")
+    if ev == "started":
+        st.caption(f"🔧 Running **{tool}**… {last.get('args', '')}")
+    elif ev == "finished":
+        ms = last.get("duration_ms", 0)
+        ok = last.get("ok", True)
+        icon = "✅" if ok else "⚠️"
+        st.caption(f"{icon} **{tool}** finished in {ms} ms")
+    elif ev == "error":
+        st.caption(f"❌ **{tool}** failed: {last.get('error', 'unknown')}")
+
+
+@_fragment
 def _flush_lore_confirmations() -> None:
     """Drain queued lore-save confirmations into the chat transcript.
 
@@ -513,6 +598,9 @@ def _flush_lore_confirmations() -> None:
     `system_note` chat bubble — NOT a popup, NOT a toast — and persist it
     into `st.session_state.messages` so it survives reruns and is part of
     the visible transcript.
+
+    Wrapped in @st.fragment so the save banner can render without forcing
+    the full page (chat history, sidebar, model picker) to redraw.
     """
     pending = st.session_state.get("_lore_save_confirmations") or []
     if not pending:
@@ -535,31 +623,69 @@ def _flush_lore_confirmations() -> None:
     st.session_state["_lore_save_confirmations"] = []
 
 
+def _captured_stream(chunks, sink: list[str]):
+    """Wrap a chunk iterator so that st.write_stream gets the chunks AND we
+    keep a copy of the assembled text for persistence/TTS afterwards.
+
+    st.write_stream itself returns the joined string when given an iterator
+    of strings, but we still maintain `sink` as a safety net for exception
+    paths (the iterator might raise mid-stream and st.write_stream re-raises).
+    """
+    for chunk in chunks:
+        if not chunk:
+            continue
+        sink.append(chunk)
+        yield chunk
+
+
 def display_and_store_response(response: "str | Iterator[str]") -> str:
     """Render an assistant response. Accepts a finished string OR a stream of
-    text chunks (from the Groq streaming path). Returns the full final text so
-    callers can store / replay it (e.g. auto-TTS).
+    text chunks (from the Groq streaming path). Uses `st.write_stream` so
+    tokens paint as fast as they arrive — no artificial typewriter sleeps,
+    no manual placeholder.markdown loop that pegs the script thread.
+    Returns the full final text so callers can store / replay it (auto-TTS).
     """
     full_text = ""
     with st.chat_message("assistant", avatar=get_avatar()):
+        write_stream = getattr(st, "write_stream", None)
+
         if isinstance(response, str):
+            # Already-finished string (Thinker path). st.write_stream accepts
+            # a generator OR a callable; we use a one-shot generator so the
+            # text appears immediately without re-implementing the typewriter
+            # loop. Falls back to plain markdown on older Streamlit builds.
             full_text = response or ""
-            try:
-                stream_data_to_chat(full_text)
-            except Exception:
-                st.markdown(full_text)
+            if write_stream is not None and full_text:
+                try:
+                    write_stream(iter([full_text]))
+                except Exception:
+                    st.markdown(full_text)
+            else:
+                st.markdown(full_text or "No response generated.")
         else:
-            # Live token stream — render incrementally without per-token sleep.
-            placeholder = st.empty()
+            # Live token stream from the Groq path. st.write_stream consumes
+            # the iterator and joins the strings for us. We tee the chunks
+            # into `sink` so we can persist the full reply even if the stream
+            # raises partway through.
+            sink: list[str] = []
             try:
-                for chunk in response:
-                    if not chunk:
-                        continue
-                    full_text += chunk
-                    placeholder.markdown(full_text + "▌")
-                placeholder.markdown(full_text or "No response generated.")
+                if write_stream is not None:
+                    full_text = write_stream(_captured_stream(response, sink)) or ""
+                    # If write_stream returned non-string (e.g. dicts), prefer
+                    # our own concatenated copy.
+                    if not isinstance(full_text, str):
+                        full_text = "".join(sink)
+                else:
+                    # Streamlit < 1.31 fallback — manual placeholder loop.
+                    placeholder = st.empty()
+                    for chunk in _captured_stream(response, sink):
+                        placeholder.markdown("".join(sink) + "▌")
+                    full_text = "".join(sink)
+                    placeholder.markdown(full_text or "No response generated.")
             except Exception as e:
-                placeholder.markdown(full_text or f"❌ Streaming error: {e}")
+                full_text = "".join(sink)
+                st.markdown(full_text or f"❌ Streaming error: {e}")
+
     st.session_state.setdefault("messages", []).append(
         {"role": "assistant", "content": full_text}
     )
@@ -585,6 +711,10 @@ _DEFAULT_STATE = {
     # Queue populated by the `remember_lore` tool dispatcher; drained into
     # the chat transcript by _flush_lore_confirmations().
     "_lore_save_confirmations": [],
+    # Cross-thread status queue + render-side log for the tool status
+    # banner. The queue itself is lazily created by tools.push_tool_status
+    # because queue.Queue isn't JSON-serialisable; this just primes the log.
+    "_tool_status_log": [],
 }
 
 
@@ -671,9 +801,20 @@ TOOL_GUIDANCE = (
     "- `request_user_name`: open a popup asking the user for their name "
     "ONLY if you don't already know it. Don't call it twice.\n"
     "- `remember_lore`: store a short, concrete fact about the user whenever "
-    "they share something memorable (likes, family, hobbies, etc.).\n"
+    "they share something memorable (likes, family, hobbies, etc.). Set "
+    "`private: true` for sensitive info (address, phone, mental health, "
+    "religion, romantic interests, exam scores). Set `private: false` for "
+    "harmless preferences (favourite anime, food, hobbies).\n"
     "- `recall_lore`: look up everything you remember about a named user.\n"
-    "Be natural — don't announce that you're using tools.\n"
+    "\n"
+    "**IMPORTANT — write before tooling.** When you call any tool, you MUST "
+    "also write at least one short conversational sentence in the SAME "
+    "response (before the tool call), e.g. 'On it — let me check…' or "
+    "'Got it, saving that for next time.' The UI streams that sentence to "
+    "the user immediately and runs the tool in parallel, so the chat never "
+    "looks frozen. Never emit a silent tool call.\n"
+    "Be natural — don't announce *which* tool you're using, just say "
+    "something conversational that fits the moment.\n"
 )
 
 
@@ -951,7 +1092,7 @@ def _groq_chat_with_tools(model: str, messages: list, timeout_seconds: float) ->
         )
         if hop == 0:
             # Only offer tools on the first hop; subsequent hops are pure prose.
-            kwargs["tools"] = ai_tools.OPENAI_TOOLS
+            kwargs["tools"] = get_openai_tools_cached()
             kwargs["tool_choice"] = "auto"
         response = groq_client.chat.completions.create(**kwargs)
         try:
@@ -1006,14 +1147,17 @@ def _groq_chat_with_tools(model: str, messages: list, timeout_seconds: float) ->
                 ],
             }
         )
-        # Execute every requested tool and feed results back.
-        for tc in normalised:
+        # Execute every requested tool IN PARALLEL on the shared pool and
+        # feed results back. Sequential dispatch used to be the dominant
+        # latency contributor when the model emitted 2–3 tool calls per
+        # hop (each ~1–2s of Firestore I/O).
+        for tc in ai_tools.dispatch_parallel(normalised):
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tc["id"],
                     "name": tc["name"],
-                    "content": ai_tools.dispatch_json(tc["name"], tc["arguments"]),
+                    "content": tc["content"],
                 }
             )
 
@@ -1044,7 +1188,7 @@ def _gemini_chat_with_tools(
         # models slow without quality gain for casual chat. The Thinker mode
         # picks reasoning-capable models in the sidebar instead.
         temperature=temperature,
-        tools=ai_tools.build_gemini_tools() or None,
+        tools=get_gemini_tools_cached() or None,
         # Gemini SDK takes timeout in *milliseconds*. Don't undershoot — the
         # 2.5/3.x flash models routinely take 6–15s with a 17kB system prompt.
         http_options=types.HttpOptions(timeout=int(max(timeout_seconds, 25) * 1000)),
@@ -1099,19 +1243,16 @@ def _gemini_chat_with_tools(
                         contents.append(response.candidates[0].content)
                     except Exception:
                         pass
-                    for ic in inline_calls:
-                        try:
-                            args = json.loads(ic["arguments"] or "{}")
-                        except Exception:
-                            args = {}
-                        result = ai_tools.dispatch(ic["name"], args)
+                    # Run recovered tool calls in parallel — same speedup
+                    # win as the structured-fcall path below.
+                    for tc in ai_tools.dispatch_parallel(inline_calls):
                         contents.append(
                             types.Content(
                                 role="user",
                                 parts=[
                                     types.Part.from_function_response(
-                                        name=ic["name"],
-                                        response=result,
+                                        name=tc["name"],
+                                        response=tc["result"],
                                     )
                                 ],
                             )
@@ -1125,14 +1266,26 @@ def _gemini_chat_with_tools(
             contents.append(response.candidates[0].content)
         except Exception:
             pass
-        for fc in fcalls:
-            args = dict(fc.args) if getattr(fc, "args", None) else {}
-            result = ai_tools.dispatch(fc.name, args)
+        # Normalise the Gemini-shaped fcalls into the parallel-dispatcher
+        # contract, then fire them concurrently. Most lore lookups hit
+        # Firestore — running them sequentially used to double the round-
+        # trip cost when the model invoked recall + remember in one hop.
+        normalised = [
+            {
+                "id": f"gemini_{i}",
+                "name": fc.name,
+                "arguments": json.dumps(dict(fc.args) if getattr(fc, "args", None) else {}),
+            }
+            for i, fc in enumerate(fcalls)
+        ]
+        for tc in ai_tools.dispatch_parallel(normalised):
             contents.append(
                 types.Content(
                     role="user",
                     parts=[
-                        types.Part.from_function_response(name=fc.name, response=result)
+                        types.Part.from_function_response(
+                            name=tc["name"], response=tc["result"],
+                        )
                     ],
                 )
             )
@@ -1189,16 +1342,16 @@ def _format_brain_error(brain: str, attempts: list[tuple[str, Exception]]) -> st
     return summary
 
 
-def _groq_prepare_messages_with_tools(
+def _groq_first_hop_discover(
     model: str, messages: list, timeout_seconds: float
-) -> tuple[list, str | None]:
-    """Run the non-streaming tool-discovery hop synchronously.
+) -> tuple[list, str, list[dict]]:
+    """Run the non-streaming first hop. Returns `(messages, prose, calls)`.
 
-    Returns `(updated_messages, early_text)`:
-      - `early_text` is the assistant's final text if no tools were called
-        (so the caller can yield it directly without streaming).
-      - Otherwise `early_text` is None and `updated_messages` is ready for
-        a streaming final pass.
+    `prose` is whatever text the assistant emitted alongside its tool calls
+    (often a short "Sure, let me look that up…" — we want to yield it to
+    the user *immediately* while tools run in the background).
+    `calls` is the normalised list of tool calls to execute, or [] if the
+    model is done.
 
     Raises on API/timeout errors so the outer fallback loop can pick a
     different model.
@@ -1206,7 +1359,7 @@ def _groq_prepare_messages_with_tools(
     response = groq_client.chat.completions.create(
         messages=messages,
         model=model,
-        tools=ai_tools.OPENAI_TOOLS,
+        tools=get_openai_tools_cached(),
         tool_choice="auto",
         timeout=timeout_seconds,
         max_completion_tokens=1500,
@@ -1228,57 +1381,99 @@ def _groq_prepare_messages_with_tools(
             normalised = inline_calls
             content = cleaned
 
-    if not normalised:
-        # No tools needed — return text directly (skip streaming step).
-        if not content.strip():
-            # Empty content from this model — raise so we fall back.
-            raise RuntimeError(f"{model} returned empty content")
-        return messages, _strip_inline_tool_noise(content)
+    if not normalised and not content.strip():
+        # Empty content AND no tools — raise so the outer loop falls back
+        # to the next model in the chain.
+        raise RuntimeError(f"{model} returned empty content")
 
+    return messages, _strip_inline_tool_noise(content), normalised
+
+
+def _groq_stream_with_parallel_tools(
+    model: str, messages: list, prose: str, calls: list[dict], timeout_seconds: float,
+) -> Iterator[str]:
+    """Post-first-hop generator: yield prose immediately, run tools in
+    parallel, then stream the synthesis.
+
+    Old behaviour: first hop (blocking) → tools (blocking, sequential) →
+    stream final answer. User saw a spinner for 10+ seconds when tools
+    were involved.
+
+    New behaviour:
+      1. Caller has already done the first hop (so timeouts surfaced
+         before any token was yielded — the outer fallback loop works).
+      2. We yield the model's leading prose RIGHT NOW (instant feedback).
+      3. We fire every tool call on the shared thread pool — they execute
+         in PARALLEL. Most tools are I/O bound (Firestore, SQLite), so
+         this collapses N tools' latency to max(latency_i) instead of sum.
+      4. When tools resolve, we stream the second hop (final synthesis).
+
+    The result: user sees text within ~500ms of pressing send, even if the
+    full reply requires several seconds of tool work.
+    """
+    # ---- Optimistic update: paint the prose BEFORE running tools ----
+    # If the model produced any leading text ("Hold on, let me check…"),
+    # show it to the user right away. This is the entire UX win — the
+    # chat starts moving while tools work in the background.
+    if prose:
+        yield prose
+        # Visually separate the prose from the streaming synthesis that
+        # follows so they read as two paragraphs rather than a run-on.
+        yield "\n\n"
+
+    # ---- Append the assistant turn (with its tool_calls) ----
     messages.append(
         {
             "role": "assistant",
-            "content": content,
+            "content": prose,
             "tool_calls": [
                 {
                     "id": tc["id"],
                     "type": "function",
                     "function": {"name": tc["name"], "arguments": tc["arguments"]},
                 }
-                for tc in normalised
+                for tc in calls
             ],
         }
     )
-    for tc in normalised:
+
+    # ---- Run all tools in parallel on the shared pool ----
+    # `dispatch_parallel` returns results in input order with `content`
+    # (the JSON-serialised result) already filled in. The tool_status
+    # banner fragment will paint "🔧 running X…" lines while this blocks.
+    completed = ai_tools.dispatch_parallel(calls)
+    for tc in completed:
         messages.append(
             {
                 "role": "tool",
                 "tool_call_id": tc["id"],
                 "name": tc["name"],
-                "content": ai_tools.dispatch_json(tc["name"], tc["arguments"]),
+                "content": tc["content"],
             }
         )
-    return messages, None
+
+    # ---- Stream the final synthesis ----
+    yield from _stream_groq_final(model, messages, timeout_seconds)
 
 
 def _groq_run_tools_then_stream(
     model: str, messages: list, timeout_seconds: float
 ) -> Iterator[str]:
-    """Run any tool calls (sync, fail-fast), then stream the final answer.
-
-    The first hop is materialised by the caller via _groq_prepare_messages_with_tools
-    so that timeouts/API errors there raise BEFORE any token is yielded — that
-    way the outer model-fallback loop in get_ai_response_with_brain still works.
+    """Legacy entry point preserved for compatibility — discovers tools then
+    delegates to `_groq_stream_with_parallel_tools`. New code paths in
+    `get_ai_response_with_brain` call the two halves separately so the
+    discover hop's exceptions surface before any token is yielded.
     """
-    updated, early_text = _groq_prepare_messages_with_tools(
+    messages, prose, calls = _groq_first_hop_discover(
         model, messages, timeout_seconds
     )
-    if early_text is not None:
-        # Yield as one chunk — no second round-trip needed.
-        yield early_text
+    if not calls:
+        if prose:
+            yield prose
         return
-    # Stream the final answer; tools disabled so the model has to produce prose.
-    yield from _stream_groq_final(model, updated, timeout_seconds)
+    yield from _groq_stream_with_parallel_tools(
+        model, messages, prose, calls, timeout_seconds
+    )
 
 
 def get_ai_response_with_brain(
@@ -1314,21 +1509,28 @@ def get_ai_response_with_brain(
         for model in models:
             try:
                 if stream:
-                    # IMPORTANT: do the first sync hop here (not lazily inside
-                    # the generator) so timeouts/API errors raise BEFORE the
-                    # UI starts consuming the stream. Otherwise the outer
-                    # fallback loop never sees the exception.
+                    # Run the first (non-streaming) hop synchronously HERE so
+                    # API/timeout errors raise BEFORE the UI starts consuming
+                    # the stream — otherwise the outer fallback loop never
+                    # sees the exception. The new `_groq_first_hop_discover`
+                    # only blocks on the LLM call itself, not on tools, so
+                    # the wait is the same as a no-tools chat.
                     msgs = list(base)
-                    prepared, early_text = _groq_prepare_messages_with_tools(
+                    msgs, prose, calls = _groq_first_hop_discover(
                         model, msgs, timeout
                     )
-                    if early_text is not None:
-                        # Wrap the single-string result as a one-shot iterator
-                        # so the caller still gets the streaming API.
-                        return iter([early_text])
-                    # Hand off to streaming. Subsequent stream errors fall
-                    # through to display_and_store_response's UI fallback.
-                    return _stream_groq_final(model, prepared, timeout)
+                    if not calls:
+                        # No tools needed — yield the prose as a one-shot
+                        # iterator so the caller still gets the streaming API.
+                        return iter([prose])
+                    # Tools needed — return the parallel-tools-+-stream
+                    # generator. It yields the model's leading prose
+                    # IMMEDIATELY, then fires tools in parallel, then
+                    # streams the synthesis. Errors mid-stream surface via
+                    # display_and_store_response's fallback markdown.
+                    return _groq_stream_with_parallel_tools(
+                        model, msgs, prose, calls, timeout
+                    )
                 return _groq_chat_with_tools(model, list(base), timeout)
             except Exception as e:
                 attempts.append((model, e))
@@ -1375,8 +1577,15 @@ def get_ai_response_with_brain(
 # ---------------------------------------------------------------------------
 
 
+@_fragment
 def _maybe_show_name_popup() -> None:
-    """Show the name-request popup when the AI has triggered it."""
+    """Show the name-request popup when the AI has triggered it.
+
+    Wrapped in @st.fragment so a 'Save' click only reruns this dialog —
+    the main chat container, sidebar, and model picker are untouched.
+    Previously this called st.rerun() which forced a full-page redraw
+    and made the popup feel laggy on slow connections.
+    """
     if not st.session_state.get("_name_popup_pending"):
         return
 
@@ -1399,7 +1608,13 @@ def _maybe_show_name_popup() -> None:
                 lore_store.ensure_user(name.strip())
                 st.session_state._name_popup_pending = False
                 st.session_state._name_popup_reason = ""
-                st.rerun()
+                # Inside a fragment we want to rerun just the fragment.
+                # st.rerun(scope='fragment') is the new API; older builds
+                # fall back to plain st.rerun().
+                try:
+                    st.rerun(scope="fragment")
+                except (TypeError, Exception):
+                    st.rerun()
 
     if dialog_decorator is not None:
 
@@ -1739,7 +1954,7 @@ def _sidebar_tts() -> tuple[str, str, str]:
         "Use HTML autoplay for audio (single player)", value=False
     )
     st.session_state.compact_audio_icon = st.sidebar.checkbox(
-        "Compact audio icon (play/pause)", value=True
+        "Compact audio icon (play/pause)", value=False
     )
     return engine, voice, lang
 
@@ -1760,7 +1975,7 @@ def _render_compact_audio(audio_bytes: bytes) -> None:
   <audio id="{audio_id}" src="data:audio/mp3;base64,{b64}" style="display:none;"></audio>
 </div>
 """
-    st.markdown(html, unsafe_allow_html=True)
+    components_html(html, height=44)
 
 
 def _render_html_autoplay(audio_bytes: bytes) -> None:
@@ -1780,7 +1995,7 @@ def _render_html_autoplay(audio_bytes: bytes) -> None:
   }}
 </script>
 """
-    st.markdown(html, unsafe_allow_html=True)
+    components_html(html, height=44)
 
 
 def _render_streamlit_audio(audio_bytes: bytes) -> None:
@@ -1813,10 +2028,10 @@ def render_audio_player(
     try:
         if force_autoplay:
             _render_html_autoplay(audio_bytes)
-        elif st.session_state.get("compact_audio_icon", False):
-            _render_compact_audio(audio_bytes)
         elif st.session_state.get("use_html_autoplay", False):
             _render_html_autoplay(audio_bytes)
+        elif st.session_state.get("compact_audio_icon", False):
+            _render_compact_audio(audio_bytes)
         else:
             _render_streamlit_audio(audio_bytes)
     except Exception:
@@ -1958,6 +2173,10 @@ def main() -> None:
 
     # --- Main panel ---
     display_chat_history()
+    # Optimistic-update banner: shows "🔧 running tool…" the moment a tool
+    # dispatch starts, even if the LLM stream is still going. Lives in its
+    # own fragment so it can update without redrawing the chat history.
+    _render_tool_status_banner()
     _show_initial_greeting(personality)
 
     if prompt := st.chat_input(get_catchy_phrase()):

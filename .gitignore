@@ -26,7 +26,3 @@ private_lore.db
 
 # Generated audio
 *.mp3
-
-# Test scripts
-test_tts.py
-
