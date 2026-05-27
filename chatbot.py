@@ -847,8 +847,10 @@ def initialize_session_state() -> None:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_system_prompt() -> str:
-    """Load the base system prompt (prefers .md, falls back to .txt)."""
+def _load_raw_system_prompt() -> str:
+    """Load the FULL system prompt file once and cache. Reads from disk only
+    on cache miss; subsequent reads are in-memory. The cache key is empty
+    so the file is read once per process lifetime (TTL 1h)."""
     for path in ("System_prompt.md", "System_prompt.txt"):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -858,6 +860,81 @@ def load_system_prompt() -> str:
         except Exception:
             continue
     return "You are a helpful and humorous assistant named Sanniva."
+
+
+# Persona-mode subsection labels as written in System_prompt.md. Used to
+# locate and strip inactive mode blocks at prompt-build time so we don't
+# send all 7 mode descriptions to the LLM every turn (saves ~1,300 tokens
+# per request — see TOKEN_BUDGET.md).
+_PERSONA_SUBSECTION_HEADERS = {
+    "Roaster":           "Roaster Mode (DEFAULT)",
+    "Smart":             "Smart Mode",
+    "Debater":           "Debater Mode",
+    "Strategic":         "Strategic Mode",
+    "Tech Nerd":         "Tech Nerd Mode",
+    "Chill Squad":       "Chill Squad Mode",
+    "Exhausted Student": "Exhausted Student Mode",
+}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_system_prompt(active_persona: str = "") -> str:
+    """Load the base system prompt with only the ACTIVE persona-mode
+    subsection retained inside `## 1. Persona Modes`.
+
+    The full file (`System_prompt.md`) is ~47 KB / ~11,600 tokens and grew
+    organically. Most of its weight is content the model needs once (the
+    rules, the lore) — but the 7 persona-mode subsections under §1 are
+    mutually exclusive: only one is active per turn. Keeping the other 6
+    in the prompt was pure waste (~1,300 tokens / 3 KB).
+
+    This function reads the cached raw file, finds the §1 block, replaces
+    its body with a short header + the single matching mode subsection,
+    and returns the trimmed prompt. Caching is keyed by `active_persona`
+    so each mode is built once per session.
+
+    Falls back gracefully: if the active persona isn't found or the §1
+    boundaries can't be located, returns the unmodified file.
+    """
+    raw = _load_raw_system_prompt()
+    if not active_persona or active_persona not in _PERSONA_SUBSECTION_HEADERS:
+        return raw
+
+    # Locate `## 1. Persona Modes` section bounds.
+    section_match = re.search(
+        r"(?ms)^(## 1\. Persona Modes[^\n]*\n.*?)(?=^## 2\.)",
+        raw,
+    )
+    if not section_match:
+        return raw
+
+    section_text = section_match.group(1)
+
+    # Find the active mode subsection (e.g. `### 🔥 Roaster Mode (DEFAULT)`).
+    target_label = re.escape(_PERSONA_SUBSECTION_HEADERS[active_persona])
+    active_sub = re.search(
+        r"(?ms)^### [^\n]*" + target_label + r"[^\n]*\n.*?(?=^### |\Z)",
+        section_text,
+    )
+    if not active_sub:
+        return raw
+
+    # Rebuild §1 with just the intro paragraph + the active mode subsection
+    # + a one-line note that other modes exist but aren't relevant this
+    # turn. The intro is everything before the first `### ` in the section.
+    intro_match = re.search(r"(?ms)^(## 1\.[^\n]*\n.*?)(?=^### )", section_text)
+    intro = intro_match.group(1) if intro_match else "## 1. Persona Modes\n\n"
+
+    trimmed_section = (
+        intro
+        + active_sub.group(0).rstrip()
+        + "\n\n*(Other persona modes exist — Roaster, Smart, Debater, "
+        + "Strategic, Tech Nerd, Chill Squad, Exhausted Student — but "
+        + "only the one above is active for this conversation. The app "
+        + "will swap modes if the user picks a different one.)*\n\n"
+    )
+
+    return raw[: section_match.start()] + trimmed_section + raw[section_match.end() :]
 
 
 PERSONALITY_SUFFIX = {
@@ -1186,7 +1263,29 @@ def build_temporal_context(today: date | None = None) -> str:
 def build_system_prompt(
     base: str, personality: str, brain_type: str, user_name: str = ""
 ) -> str:
-    prompt = (base or "") + build_temporal_context()
+    """Assemble the per-turn system prompt.
+
+    Layout matters for Groq's automatic prompt caching: the cache hits on
+    matching PREFIXES, breaking at the first byte of difference. So we
+    front-load everything that stays identical across turns and push
+    per-turn / per-day variability to the end. Concretely:
+
+        [BASE FILE (static within session)]
+        [PERSONA SUFFIX (changes only when user switches mode)]
+        [THINKER SUFFIX (changes only when brain switches)]
+        [TOOL_GUIDANCE (fully static)]
+        ─── cacheable prefix ends here on a typical turn ───
+        [USER NAME + LORE (changes when name/lore updates)]
+        [POPUP STATE (changes per turn while popup active)]
+        [TEMPORAL CONTEXT (changes daily)]
+
+    Putting temporal context at the END instead of the start (where it
+    used to be) means yesterday's cached prefix can still be re-used
+    today for everything before that section. Same idea for the popup
+    state — moving it past the lore block keeps lore-tier hits stable
+    even when the popup flips state mid-session.
+    """
+    prompt = base or ""
     prompt += PERSONALITY_SUFFIX.get(personality, "")
     if brain_type == "Thinker":
         prompt += " Use deep thinking to analyze the request before answering."
@@ -1230,6 +1329,13 @@ def build_system_prompt(
                 "interrogation), you MAY call `request_user_name` exactly "
                 "ONCE this session. Never call it twice.\n"
             )
+
+    # Temporal context goes LAST so the daily-changing date string doesn't
+    # invalidate the cacheable prefix above it. Previously this was prepended
+    # to the base — that meant every new day broke Groq's prompt cache for
+    # the entire prompt. Moving it to the end keeps ~95% of the prompt
+    # cacheable across the day boundary.
+    prompt += build_temporal_context()
     return prompt
 
 
@@ -1302,6 +1408,64 @@ def _strip_inline_tool_noise(text: str) -> str:
     return cleaned.strip()
 
 
+def _record_cache_usage(response: Any, *, model: str = "", hop: str = "") -> None:
+    """Pull Groq's prompt-cache hit metrics off a chat completion response
+    and stash them in session_state so the sidebar can show savings.
+
+    Groq returns `usage.prompt_tokens_details.cached_tokens` on every
+    completion. A hit means we paid 50% for those tokens instead of full
+    price (their automatic caching, no opt-in needed — we just need the
+    prefix to stay deterministic, which is what the prompt-building
+    refactor above is for).
+
+    Stored shape (session_state['_groq_cache_stats']):
+        {
+          'total_prompt_tokens': int,   # cumulative across session
+          'total_cached_tokens': int,   # cumulative across session
+          'last_prompt_tokens': int,
+          'last_cached_tokens': int,
+          'last_model': str,
+          'last_hop': str,
+        }
+    """
+    try:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+        details = getattr(usage, "prompt_tokens_details", None)
+        cached = 0
+        if details is not None:
+            cached = getattr(details, "cached_tokens", 0) or 0
+        # On the openai SDK shape this may be a dict instead of an object.
+        if cached == 0:
+            d = (
+                getattr(usage, "prompt_tokens_details", None)
+                if not isinstance(usage, dict)
+                else usage.get("prompt_tokens_details")
+            )
+            if isinstance(d, dict):
+                cached = int(d.get("cached_tokens", 0) or 0)
+
+        stats = st.session_state.setdefault("_groq_cache_stats", {
+            "total_prompt_tokens": 0,
+            "total_cached_tokens": 0,
+            "last_prompt_tokens": 0,
+            "last_cached_tokens": 0,
+            "last_model": "",
+            "last_hop": "",
+        })
+        stats["total_prompt_tokens"] += int(prompt_tokens)
+        stats["total_cached_tokens"] += int(cached)
+        stats["last_prompt_tokens"] = int(prompt_tokens)
+        stats["last_cached_tokens"] = int(cached)
+        stats["last_model"] = model
+        stats["last_hop"] = hop
+    except Exception:
+        # Cache telemetry must never break a turn.
+        pass
+
+
 def _stream_groq_final(
     model: str, messages: list, timeout_seconds: float
 ) -> Iterator[str]:
@@ -1309,6 +1473,11 @@ def _stream_groq_final(
 
     Used after any tool-calling hops have resolved, so we can stream the
     user-visible answer for faster perceived latency.
+
+    `stream_options={"include_usage": True}` tells Groq to emit a final
+    usage chunk after the content stream completes — that's where the
+    prompt-cache hit stats live. Without it we can't measure cache wins
+    on streamed turns.
     """
     stream = groq_client.chat.completions.create(
         messages=messages,
@@ -1318,15 +1487,25 @@ def _stream_groq_final(
         timeout=timeout_seconds,
         max_completion_tokens=1500,
         stream=True,
+        stream_options={"include_usage": True},
     )
+    last_chunk = None
     for chunk in stream:
+        last_chunk = chunk
         try:
-            delta = chunk.choices[0].delta
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                # Usage-only final chunk has empty choices on most providers.
+                continue
+            delta = choices[0].delta
             piece = getattr(delta, "content", None)
         except Exception:
             piece = None
         if piece:
             yield piece
+    # Record cache stats from the final chunk's usage block (if present).
+    if last_chunk is not None:
+        _record_cache_usage(last_chunk, model=model, hop="stream-final")
 
 
 def _groq_chat_with_tools(model: str, messages: list, timeout_seconds: float) -> str:
@@ -1352,6 +1531,7 @@ def _groq_chat_with_tools(model: str, messages: list, timeout_seconds: float) ->
             kwargs["tools"] = get_openai_tools_cached()
             kwargs["tool_choice"] = "auto"
         response = groq_client.chat.completions.create(**kwargs)
+        _record_cache_usage(response, model=model, hop=f"chat-with-tools/hop-{hop}")
         try:
             msg = response.choices[0].message
         except Exception:
@@ -1621,6 +1801,7 @@ def _groq_first_hop_discover(
         timeout=timeout_seconds,
         max_completion_tokens=1500,
     )
+    _record_cache_usage(response, model=model, hop="first-hop-discover")
     msg = response.choices[0].message
     content = msg.content or ""
     tool_calls = getattr(msg, "tool_calls", None) or []
@@ -2036,7 +2217,53 @@ def _sidebar_model_settings() -> float:
     )
 
     _sidebar_model_chain_picker()
+    _sidebar_cache_savings()
     return temperature
+
+
+def _sidebar_cache_savings() -> None:
+    """Show Groq prompt-cache hit stats so you can verify the cost
+    optimisation is actually working. Stats are populated by
+    `_record_cache_usage` after every Groq completion in this session.
+
+    Why this exists: Groq's prompt caching is automatic but invisible.
+    The only way to know it's hitting is to read `cached_tokens` off the
+    usage block. Surfacing it in the sidebar turns "I think we saved
+    money" into a measurable number you can quote.
+    """
+    stats = st.session_state.get("_groq_cache_stats")
+    if not stats or stats.get("total_prompt_tokens", 0) == 0:
+        return
+
+    total = stats["total_prompt_tokens"]
+    cached = stats["total_cached_tokens"]
+    last_total = stats["last_prompt_tokens"]
+    last_cached = stats["last_cached_tokens"]
+
+    hit_rate = (cached / total * 100) if total else 0
+    last_hit_rate = (last_cached / last_total * 100) if last_total else 0
+    # Groq's documented discount is 50% on cached input tokens — so the
+    # effective tokens billed = total - 0.5*cached.
+    effective_billed = total - 0.5 * cached
+    savings_pct = ((total - effective_billed) / total * 100) if total else 0
+
+    with st.sidebar.expander(f"💰 Cache savings: {savings_pct:.0f}%", expanded=False):
+        st.caption(
+            f"**Session total:** {total:,} prompt tokens, "
+            f"{cached:,} from cache ({hit_rate:.0f}% hit rate)."
+        )
+        st.caption(
+            f"**Last turn:** {last_total:,} tokens, "
+            f"{last_cached:,} cached ({last_hit_rate:.0f}% hit rate)."
+        )
+        st.caption(
+            f"Effective billed: ~{effective_billed:,.0f} tokens "
+            f"(saved ~{total - effective_billed:,.0f} = {savings_pct:.0f}%)."
+        )
+        st.caption(
+            "Groq applies a 50% discount on cached input tokens automatically. "
+            "Cache expires after ~2 hours of no use."
+        )
 
 
 def _sidebar_model_chain_picker() -> None:
@@ -2553,7 +2780,10 @@ def main() -> None:
             st.markdown(prompt)
 
         system_prompt = build_system_prompt(
-            load_system_prompt(),
+            # Pass the active persona so load_system_prompt strips the 6
+            # inactive mode subsections at the source (~1,300-token saving
+            # per request). Cached per-persona, so each mode is built once.
+            load_system_prompt(personality),
             personality,
             brain_type,
             user_name=st.session_state.get("user_name", ""),
