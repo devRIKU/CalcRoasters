@@ -483,9 +483,10 @@ def get_catchy_phrase() -> str:
                 },
                 {
                     "role": "user",
-                    "content": "Generate a catchy phrase to encourage users to interact with a chatbot that helps "
-                    "with anything and roasts them humorously. Plain text only — no quotes or formatting. "
-                    "Return only the phrase.",
+                    "content": "Generate a short, friendly placeholder for a chat input box. The chatbot is a "
+                    "witty, warm friend who can help with anything (homework, advice, coding, just chatting). "
+                    "She's playfully sarcastic occasionally but mostly genuine. Avoid the words 'roast' or "
+                    "'savage'. Plain text only — no quotes or formatting. Return only the phrase.",
                 },
             ],
             # Smallest, fastest production model. Was the deprecated
@@ -638,53 +639,169 @@ def _captured_stream(chunks, sink: list[str]):
         yield chunk
 
 
-def display_and_store_response(response: "str | Iterator[str]") -> str:
-    """Render an assistant response. Accepts a finished string OR a stream of
-    text chunks (from the Groq streaming path). Uses `st.write_stream` so
-    tokens paint as fast as they arrive — no artificial typewriter sleeps,
-    no manual placeholder.markdown loop that pegs the script thread.
+def _word_stream(text: str, delay: float = 0.018):
+    """Yield a string word-by-word with a tiny per-word delay.
+
+    Used for the Thinker path where we get a fully-formed reply and want to
+    animate it like a stream. Re-emits whitespace separators so markdown
+    spacing is preserved. The delay is small enough that it never blocks
+    the script meaningfully (a 200-word reply takes ~3.6s to paint, which
+    matches the perceived speed of a real LLM stream).
+    """
+    import re as _re
+    # Split keeping the separators so "hello world" -> ["hello", " ", "world"].
+    parts = _re.split(r"(\s+)", text)
+    for p in parts:
+        if not p:
+            continue
+        yield p
+        if delay > 0 and not p.isspace():
+            time.sleep(delay)
+
+
+def _word_chunk_stream(chunks, sink: list[str], delay: float = 0.012):
+    """Convert an LLM token stream into a word-by-word visible stream.
+
+    Real LLM token streams are jagged — sometimes a whole sentence arrives
+    in one chunk, sometimes a single character. To get a smooth typewriter
+    look we buffer until we see whitespace, then flush the completed word
+    (with a small delay) before continuing.
+
+    Also tees into `sink` so we keep a copy of the assembled text for
+    persistence + TTS even if the iterator raises mid-stream.
+    """
+    buffer = ""
+    for chunk in chunks:
+        if not chunk:
+            continue
+        sink.append(chunk)
+        buffer += chunk
+        # Flush complete words (everything up to the last whitespace).
+        while True:
+            ws_idx = -1
+            for i, ch in enumerate(buffer):
+                if ch.isspace():
+                    ws_idx = i
+                    break
+            if ws_idx < 0:
+                break
+            word = buffer[: ws_idx + 1]  # include the whitespace
+            buffer = buffer[ws_idx + 1 :]
+            yield word
+            if delay > 0:
+                time.sleep(delay)
+    # Flush whatever trailing fragment is left (no trailing whitespace).
+    if buffer:
+        yield buffer
+
+
+def display_and_store_response(
+    response: "str | Iterator[str]",
+    *,
+    generating_phrase: str | None = None,
+) -> str:
+    """Render an assistant response with a whimsical "generating" indicator.
+
+    Lifecycle of the indicator (Claude-Code-style):
+      1. BEFORE any token arrives → show `🌀 <generating_phrase>…` ABOVE the
+         (empty) chat bubble so the user knows we're working.
+      2. The FIRST token arrives → indicator moves BELOW the bubble (as a
+         small italic caption) and the words start typing in.
+      3. The stream finishes → indicator is removed entirely.
+
+    The streaming animation is word-by-word with a small per-word delay
+    (≈12 ms) so it feels like a typewriter even when the underlying LLM
+    chunks are jagged (sometimes whole sentences, sometimes single chars).
+
     Returns the full final text so callers can store / replay it (auto-TTS).
     """
     full_text = ""
-    with st.chat_message("assistant", avatar=get_avatar()):
-        write_stream = getattr(st, "write_stream", None)
 
-        if isinstance(response, str):
-            # Already-finished string (Thinker path). st.write_stream accepts
-            # a generator OR a callable; we use a one-shot generator so the
-            # text appears immediately without re-implementing the typewriter
-            # loop. Falls back to plain markdown on older Streamlit builds.
-            full_text = response or ""
-            if write_stream is not None and full_text:
-                try:
-                    write_stream(iter([full_text]))
-                except Exception:
-                    st.markdown(full_text)
-            else:
-                st.markdown(full_text or "No response generated.")
-        else:
-            # Live token stream from the Groq path. st.write_stream consumes
-            # the iterator and joins the strings for us. We tee the chunks
-            # into `sink` so we can persist the full reply even if the stream
-            # raises partway through.
-            sink: list[str] = []
-            try:
-                if write_stream is not None:
-                    full_text = write_stream(_captured_stream(response, sink)) or ""
-                    # If write_stream returned non-string (e.g. dicts), prefer
-                    # our own concatenated copy.
-                    if not isinstance(full_text, str):
-                        full_text = "".join(sink)
+    # Layout: pre-bubble indicator slot, bubble, post-bubble indicator slot.
+    # We use two `st.empty()` placeholders so we can swap which one is
+    # populated without leaving stale artefacts.
+    pre_indicator = st.empty()
+    bubble_container = st.container()
+    post_indicator = st.empty()
+
+    if generating_phrase:
+        # Step 1: indicator above empty bubble.
+        pre_indicator.markdown(
+            f"<div style='color:#888;font-style:italic;font-size:0.9em;"
+            f"margin:4px 0;'>🌀 {generating_phrase}</div>",
+            unsafe_allow_html=True,
+        )
+
+    write_stream = getattr(st, "write_stream", None)
+
+    with bubble_container:
+        with st.chat_message("assistant", avatar=get_avatar()):
+            # We need to know when the FIRST chunk arrives so we can swap
+            # the indicator from "pre" to "post". Wrap whichever iterator
+            # we're consuming so the first yielded item triggers the swap.
+            first_chunk_seen = {"flag": False}
+
+            def _swap_on_first(chunks):
+                for chunk in chunks:
+                    if not chunk:
+                        continue
+                    if not first_chunk_seen["flag"]:
+                        first_chunk_seen["flag"] = True
+                        # Clear the pre-bubble indicator and (re)populate
+                        # the post-bubble one so it sits under the text.
+                        pre_indicator.empty()
+                        if generating_phrase:
+                            post_indicator.markdown(
+                                f"<div style='color:#888;font-style:italic;"
+                                f"font-size:0.85em;margin-top:4px;'>"
+                                f"🌀 {generating_phrase}</div>",
+                                unsafe_allow_html=True,
+                            )
+                    yield chunk
+
+            if isinstance(response, str):
+                # Already-finished string (Thinker path). Animate it word
+                # by word so it still feels live; falls back to plain
+                # markdown on Streamlit builds without write_stream.
+                full_text = response or ""
+                if write_stream is not None and full_text:
+                    try:
+                        write_stream(_swap_on_first(_word_stream(full_text)))
+                    except Exception:
+                        st.markdown(full_text)
                 else:
-                    # Streamlit < 1.31 fallback — manual placeholder loop.
-                    placeholder = st.empty()
-                    for chunk in _captured_stream(response, sink):
-                        placeholder.markdown("".join(sink) + "▌")
+                    # No write_stream → just paint it in one go after the
+                    # spinner swap.
+                    if full_text and not first_chunk_seen["flag"]:
+                        first_chunk_seen["flag"] = True
+                        pre_indicator.empty()
+                    st.markdown(full_text or "No response generated.")
+            else:
+                # Live token stream from the Groq path. Pipe through
+                # `_word_chunk_stream` so the visible animation is one
+                # word at a time even when chunks are uneven.
+                sink: list[str] = []
+                try:
+                    if write_stream is not None:
+                        full_text = write_stream(
+                            _swap_on_first(_word_chunk_stream(response, sink))
+                        ) or ""
+                        if not isinstance(full_text, str):
+                            full_text = "".join(sink)
+                    else:
+                        # Manual fallback for older Streamlit.
+                        placeholder = st.empty()
+                        for chunk in _swap_on_first(_word_chunk_stream(response, sink)):
+                            placeholder.markdown("".join(sink) + "▌")
+                        full_text = "".join(sink)
+                        placeholder.markdown(full_text or "No response generated.")
+                except Exception as e:
                     full_text = "".join(sink)
-                    placeholder.markdown(full_text or "No response generated.")
-            except Exception as e:
-                full_text = "".join(sink)
-                st.markdown(full_text or f"❌ Streaming error: {e}")
+                    st.markdown(full_text or f"❌ Streaming error: {e}")
+
+    # Step 3: stream done — clear BOTH indicator slots.
+    pre_indicator.empty()
+    post_indicator.empty()
 
     st.session_state.setdefault("messages", []).append(
         {"role": "assistant", "content": full_text}
@@ -704,6 +821,12 @@ _DEFAULT_STATE = {
     "user_name": "",
     "_name_popup_pending": False,
     "_name_popup_reason": "",
+    # Bounded popup re-fires: counts how many times request_user_name has
+    # raised the dialog this session, and whether the user has explicitly
+    # skipped it. Both are consulted by tools._dispatch_inner to prevent
+    # the LLM from looping on "ask the user their name".
+    "_name_popup_count": 0,
+    "_name_popup_dismissed": False,
     # Auto-play bookkeeping: index of the last assistant message we already
     # spoke. Starts at -1 so the very first response is eligible.
     "last_spoken_idx": -1,
@@ -738,8 +861,19 @@ def load_system_prompt() -> str:
 
 
 PERSONALITY_SUFFIX = {
-    "Roaster": " You are in ROAST MODE. Be savage, and roast the user humorously based on "
-    "their input. Have fun and show no mercy.",
+    "Roaster": (
+        " You are in ROASTER MODE — but read the room. You are NOT a roast "
+        "machine; you are a witty friend who happens to roast when there's a "
+        "clear opening. Most of the time, just be a normal, warm, slightly "
+        "sarcastic friend. Only roast when (a) the user does something "
+        "obviously roast-worthy (humble-brag, dumb take, asks for a roast, "
+        "shares a fail), (b) it's playful and clearly affectionate, and "
+        "(c) it actually fits the moment. If they ask a real question, "
+        "vent, share something serious, or just want to chat, answer "
+        "genuinely — DO NOT shoehorn a roast in. Aim for maybe 1 in 4 "
+        "messages having a light tease. Never be cruel, never punch down, "
+        "and remember the Ayushi Protocol is absolute."
+    ),
     "Smart": " Respond intelligently, academically, and thoughtfully.",
     "Debater": " Engage in debates, present multiple viewpoints, and challenge the user's "
     "ideas respectfully.",
@@ -769,7 +903,7 @@ PERSONALITY_SUFFIX = {
 }
 
 PERSONALITY_CAPTION = {
-    "Roaster": "😂 **Roaster:** Witty & Savage",
+    "Roaster": "😂 **Roaster:** Witty friend, teases when you ask for it",
     "Smart": "🧠 **Smart:** Intelligent & Polite",
     "Debater": "🎓 **Debater:** Debates Against Anything",
     "Strategic": "♟️ **Strategic:** Efficient & Calculated",
@@ -787,6 +921,103 @@ PERSONALITY_GREETING = {
     "Chill Squad": "hey! *waves* it's Sanniva. just chilling. how's life been with the squad?",
     "Exhausted Student": "*sighs deeply* …hi. it's Sanniva. i swear if this is more homework i'm going to lose it.",
 }
+
+# Whimsical "thinking…" phrases shown while the LLM is generating. One list
+# per personality mode so the spinner caption matches Sanniva's current
+# attitude. Picked at random per turn; first phrase shows above the chat
+# bubble until the first token arrives, then moves below and stays until
+# the response finishes streaming.
+GENERATING_PHRASES = {
+    "Roaster": [
+        # Mostly normal-friend phrases; a couple keep the option open for
+        # when an actual roast moment lands. Matches the "1 in 4" frequency.
+        "Thinking it over…",
+        "Cooking up an answer…",
+        "Just a sec, brain loading…",
+        "Hmm, lemme think…",
+        "Pulling my thoughts together…",
+        "Okay, give me a moment…",
+        "Picking the right words…",
+        # Lightly cheeky options for actual roast moments:
+        "Picking the perfect comeback…",
+        "Recalibrating my sarcasm sensors…",
+    ],
+    "Smart": [
+        "Cross-referencing seventeen textbooks…",
+        "Consulting the academic archives…",
+        "Citing my sources before I even start…",
+        "Formulating a thesis statement…",
+        "Putting on my reading glasses…",
+        "Synthesizing the optimal answer…",
+    ],
+    "Debater": [
+        "Marshalling the counter-arguments…",
+        "Stress-testing your premise…",
+        "Drafting my rebuttal…",
+        "Finding the logical fallacy…",
+        "Steelmanning your position first…",
+        "Loading three opposing viewpoints…",
+    ],
+    "Strategic": [
+        "Modeling the decision tree…",
+        "Optimizing the response vector…",
+        "Calculating expected value…",
+        "Running the simulation…",
+        "Plotting the path of least resistance…",
+        "Triangulating the best play…",
+    ],
+    "Tech Nerd": [
+        "Compiling neurons.exe…",
+        "Allocating brain RAM (8GB ought to be enough)…",
+        "git pull origin smart-answer…",
+        "Querying Stack Overflow… mentally…",
+        "Reticulating splines…",
+        "*closes 14 chrome tabs* okay focus…",
+        "Loading the answer at 60fps…",
+    ],
+    "Chill Squad": [
+        "ngl just vibing while i think…",
+        "lemme just chill on this for a sec…",
+        "okay okay okay let me cook…",
+        "thinking… but make it lowercase…",
+        "fr fr give me a second…",
+        "*sips matcha* lemme see…",
+    ],
+    "Exhausted Student": [
+        "*sigh*… running on three hours of sleep…",
+        "Trying to remember if I studied this…",
+        "Locating my last brain cell…",
+        "Powering up on the last of my chai…",
+        "Searching for motivation… not found…",
+        "Pulling an answer out of sheer willpower…",
+        "Will think about it after this nap…",
+    ],
+}
+
+# Fallback list when personality isn't recognised — generic Sanniva voice.
+GENERATING_PHRASES_DEFAULT = [
+    "Realigning brain cells…",
+    "Formulating the solution…",
+    "Cooking something up…",
+    "Thinking real hard…",
+    "Loading wit.exe…",
+]
+
+
+def pick_generating_phrase(personality: str) -> str:
+    """Return one randomly-chosen whimsical 'thinking' phrase for the
+    current personality mode. Random per call so consecutive messages
+    don't show the same phrase twice in a row.
+    """
+    import random
+    phrases = GENERATING_PHRASES.get(personality) or GENERATING_PHRASES_DEFAULT
+    last = st.session_state.get("_last_generating_phrase")
+    # Avoid showing the same phrase twice in a row when the list has options.
+    pool = [p for p in phrases if p != last] or phrases
+    choice = random.choice(pool)
+    st.session_state["_last_generating_phrase"] = choice
+    return choice
+
 
 OS_GREETING = {
     "windows": "Hi Windows User! Arent you glad giving all your data to Microsoft?",
@@ -963,16 +1194,42 @@ def build_system_prompt(
 
     if user_name:
         prompt += (
-            f"\n\nThe person you are currently chatting with is **{user_name}**.\n"
+            f"\n\nThe person you are currently chatting with is **{user_name}**. "
+            f"You ALREADY KNOW their name — do NOT call `request_user_name`. "
+            f"Use their name directly when it feels natural.\n"
         )
         lore_block = lore_store.render_lore_block(user_name)
         if lore_block:
             prompt += "\n" + lore_block + "\n"
     else:
-        prompt += (
-            "\n\nYou do not yet know the user's name. If it feels natural, call the "
-            "`request_user_name` tool ONCE to ask for it via a popup.\n"
-        )
+        # If the popup was already shown and declined this session, tell the
+        # LLM not to keep asking. Streamlit's session_state is the source of
+        # truth here — read at prompt-build time so it's always current.
+        try:
+            dismissed = bool(st.session_state.get("_name_popup_dismissed"))
+            count = int(st.session_state.get("_name_popup_count", 0))
+        except Exception:
+            dismissed, count = False, 0
+
+        if dismissed or count >= 2:
+            prompt += (
+                "\n\nYou don't know the user's name and they have already chosen "
+                "not to share it. Do NOT call `request_user_name`. Continue "
+                "the conversation without using a name.\n"
+            )
+        elif count >= 1:
+            prompt += (
+                "\n\nA popup asking for the user's name is already open or was "
+                "shown this turn. Do NOT call `request_user_name` again. If "
+                "they answer, the name will appear next turn automatically.\n"
+            )
+        else:
+            prompt += (
+                "\n\nYou do not yet know the user's name. ONLY if it feels "
+                "genuinely natural (not on the first reply, not as a forced "
+                "interrogation), you MAY call `request_user_name` exactly "
+                "ONCE this session. Never call it twice.\n"
+            )
     return prompt
 
 
@@ -1588,6 +1845,12 @@ def _maybe_show_name_popup() -> None:
     """
     if not st.session_state.get("_name_popup_pending"):
         return
+    # Belt-and-braces: if the name is already on file, the popup must NEVER
+    # show. This catches the edge case where the LLM raised the popup in
+    # one turn and the user typed their name into the sidebar instead.
+    if (st.session_state.get("user_name") or "").strip():
+        st.session_state["_name_popup_pending"] = False
+        return
 
     reason = (
         st.session_state.get("_name_popup_reason")
@@ -1600,21 +1863,44 @@ def _maybe_show_name_popup() -> None:
     def _render_form() -> None:
         st.write(reason)
         with st.form("name_popup_form", clear_on_submit=False):
+            # Stable widget `key=` so typing isn't clobbered by a fragment
+            # rerun. Without a key, Streamlit recreates the widget on every
+            # rerun and re-seeds the value from `value=`, losing in-flight
+            # keystrokes if the user types fast.
             name = st.text_input(
-                "Your name", value=st.session_state.get("user_name", "")
+                "Your name",
+                value=st.session_state.get("user_name", ""),
+                key="_name_popup_text_input",
+                placeholder="Type your name here…",
             )
-            if st.form_submit_button("Save") and name.strip():
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                save_clicked = st.form_submit_button("💾 Save", use_container_width=True)
+            with col2:
+                skip_clicked = st.form_submit_button(
+                    "Skip for now", use_container_width=True, type="secondary",
+                )
+
+            if save_clicked and name.strip():
+                # Persist the name + clear all popup state in one shot so
+                # the next script rerun sees a clean slate.
                 st.session_state.user_name = name.strip()
                 lore_store.ensure_user(name.strip())
                 st.session_state._name_popup_pending = False
                 st.session_state._name_popup_reason = ""
-                # Inside a fragment we want to rerun just the fragment.
-                # st.rerun(scope='fragment') is the new API; older builds
-                # fall back to plain st.rerun().
-                try:
-                    st.rerun(scope="fragment")
-                except (TypeError, Exception):
-                    st.rerun()
+                st.session_state._name_popup_text_input = ""  # reset widget
+                # Force a FULL rerun (not fragment-scoped) — we need the
+                # chat container's next system_prompt build to pick up the
+                # new name, which is in the outer script's closure.
+                st.rerun()
+            elif skip_clicked:
+                # User explicitly declined. Lock the popup down so the LLM
+                # can't keep firing it. They can still type into the sidebar
+                # later if they change their mind.
+                st.session_state._name_popup_pending = False
+                st.session_state._name_popup_reason = ""
+                st.session_state._name_popup_dismissed = True
+                st.rerun()
 
     if dialog_decorator is not None:
 
@@ -2058,13 +2344,90 @@ def render_audio_player(
             st.warning("Failed to open local player.")
 
 
+def sanitize_for_tts(text: str) -> str:
+    """Strip markdown / formatting so TTS engines read clean prose.
+
+    Without this, every TTS voice literally pronounces the punctuation:
+      - `*sighs*`              → "asterisk sighs asterisk"
+      - `**bold**`             → "asterisk asterisk bold asterisk asterisk"
+      - `` `recall_lore` ``    → "backtick recall underscore lore backtick"
+      - `[link](http://x)`     → "bracket link bracket paren http..."
+
+    Strategy: convert to plain text, dropping anything that's purely
+    visual formatting. Stage directions like `"*sighs*"` collapse to an
+    ellipsis ("…") so there's still a tiny natural pause where the
+    persona intended emphasis, instead of the action name being read
+    aloud as words.
+    """
+    if not text:
+        return ""
+
+    out = text
+
+    # 1) Code blocks (```...```): drop entirely — they read terribly.
+    out = re.sub(r"```[\s\S]*?```", " ", out)
+
+    # 2) Inline code (`x`): keep the inner content but drop the backticks.
+    out = re.sub(r"`([^`]+)`", r"\1", out)
+
+    # 3) Bold markers FIRST (before any single-asterisk pass), because
+    #    `**bold**` contains `*bold*` as a substring and a naive
+    #    single-asterisk regex would eat its inside. Same idea for `__`.
+    out = re.sub(r"\*\*([^*\n]+)\*\*", r"\1", out)
+    out = re.sub(r"__([^_\n]+)__", r"\1", out)
+
+    # 4) Quoted stage directions ("*sighs*", "*flops on desk*"): collapse
+    #    to a short pause so the TTS doesn't read the action name as words.
+    out = re.sub(r'"\*[^*"\n]+\*"', "… ", out)
+    #    Same pattern without surrounding quotes — but only when the
+    #    inside looks like a stage direction (lowercase verb-ish words),
+    #    not regular italics. Keep the limit short (≤40 chars).
+    out = re.sub(r"\*[^*\n]{1,40}\*", "… ", out)
+
+    # 5) Remaining italic markers (*x*, _x_): keep inner text.
+    out = re.sub(r"(?<!\w)\*([^*\n]+)\*(?!\w)", r"\1", out)
+    out = re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"\1", out)
+
+    # 5) Markdown links [text](url) → just the text.
+    out = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", out)
+
+    # 6) Bare URLs — keep them out of TTS; engines mangle them anyway.
+    out = re.sub(r"https?://\S+", "", out)
+
+    # 7) Headings (#, ##, ###) at line start → strip the hashes.
+    out = re.sub(r"^\s{0,3}#{1,6}\s*", "", out, flags=re.MULTILINE)
+
+    # 8) Bullet markers (-, *, +) at line start → strip.
+    out = re.sub(r"^\s{0,3}[-*+]\s+", "", out, flags=re.MULTILINE)
+
+    # 9) Blockquote markers (>) at line start → strip.
+    out = re.sub(r"^\s{0,3}>\s?", "", out, flags=re.MULTILINE)
+
+    # 10) Any stray asterisks/underscores/backticks left over.
+    out = out.replace("*", "").replace("`", "")
+
+    # 11) Collapse runs of whitespace.
+    out = re.sub(r"[ \t]+", " ", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+
+    return out.strip()
+
+
 def _tts_for_engine(
     text: str, engine_label: str, voice: str, lang: str
 ) -> tuple[bytes | None, str]:
-    """Resolve engine label + voice to actual audio bytes."""
+    """Resolve engine label + voice to actual audio bytes.
+
+    Strips markdown / stage-direction formatting before handing the text
+    to the engine so the voice doesn't pronounce asterisks, backticks,
+    etc. literally.
+    """
+    clean = sanitize_for_tts(text)
+    if not clean:
+        return None, "❌ Nothing to read aloud (text was empty after sanitisation)"
     engine_key = TTS_ENGINE_MAP.get(engine_label, "edge")
     voice_param = voice.strip().lower() if engine_label == "Sarvam.ai" else voice
-    return generate_speech_any(text, engine=engine_key, voice=voice_param, lang=lang)
+    return generate_speech_any(text=clean, engine=engine_key, voice=voice_param, lang=lang)
 
 
 def _handle_speak_button(
@@ -2153,7 +2516,7 @@ def main() -> None:
     st.set_page_config(page_title="Sanniva AI", page_icon="🤖")
     st.title("Chat With Sanniva!")
     st.sidebar.info(
-        "I am Sanniva's Digital Twin! I can help with anything and roast you humorously."
+        "I am Sanniva's Digital Twin! I can help with anything — and yeah, I'll tease you when you ask for it."
     )
 
     # Surface init errors so missing API keys are obvious instead of
@@ -2194,7 +2557,12 @@ def main() -> None:
 
         # Fast brain streams; Thinker brain still returns a finished string.
         use_stream = brain_type == "Fast"
-        with st.spinner("Thinking..." if brain_type == "Thinker" else "Generating..."):
+        # Pick the whimsical "thinking" caption now so it stays consistent
+        # for the lifetime of this turn (don't reroll each rerun).
+        generating_phrase = pick_generating_phrase(personality)
+        # Use a built-in spinner only for the network round-trip itself —
+        # the in-bubble animated indicator handles the streaming phase.
+        with st.spinner(f"🌀 {generating_phrase}"):
             response = get_ai_response_with_brain(
                 prompt,
                 system_prompt,
@@ -2203,14 +2571,19 @@ def main() -> None:
                 temperature_val,
                 stream=use_stream,
             )
-        display_and_store_response(response)
+        display_and_store_response(response, generating_phrase=generating_phrase)
         # Render any lore-save confirmations the tool layer queued during
         # this turn. They show up inline in the chat as compact captions —
         # NOT as popups or toasts — and are persisted into the transcript.
         _flush_lore_confirmations()
-        # If a tool flipped the popup flag (e.g. request_user_name), rerun so
-        # _maybe_show_name_popup() at the top of main() actually fires it.
-        if st.session_state.get("_name_popup_pending"):
+        # If a tool flipped the popup flag (e.g. request_user_name), rerun
+        # so _maybe_show_name_popup() at the top of main() actually fires
+        # it. Guard: only rerun if name is still unknown — otherwise we'd
+        # loop when the popup already mutated the flag back to False.
+        if (
+            st.session_state.get("_name_popup_pending")
+            and not (st.session_state.get("user_name") or "").strip()
+        ):
             st.rerun()
 
     # --- Auto-play + manual speak controls for the latest assistant turn ---

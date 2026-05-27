@@ -26,3 +26,8 @@ private_lore.db
 
 # Generated audio
 *.mp3
+
+live_downloads
+live_tts_demo.png
+live_tts_download_demo.png
+live_tts_native_download_demo.png

@@ -278,14 +278,61 @@ def _summarise_args(args: dict[str, Any], max_len: int = 60) -> str:
 def _dispatch_inner(name: str, args: dict[str, Any]) -> dict[str, Any]:
     try:
         if name == "request_user_name":
-            # Signal to the Streamlit layer that a popup is needed.
+            # Short-circuit if the name is already known. The LLM sometimes
+            # forgets between turns and tries to re-ask — telling it the
+            # current name directly stops the popup from spamming.
+            current = (st.session_state.get("user_name") or "").strip()
+            if current:
+                return {
+                    "status": "already_known",
+                    "user_name": current,
+                    "note": (
+                        f"The user's name is already on file as '{current}'. "
+                        "Do NOT call this tool again this session. Use the "
+                        "name naturally in your reply."
+                    ),
+                }
+
+            # Stop re-firing the popup if the user has already declined it
+            # this session (we mark `_name_popup_dismissed` when they close
+            # the dialog without saving). Otherwise the LLM would re-trigger
+            # it on every turn, which is the bug we're fixing.
+            if st.session_state.get("_name_popup_dismissed"):
+                return {
+                    "status": "user_declined",
+                    "note": (
+                        "The user already saw the name popup this session and "
+                        "chose not to answer. Do NOT call this tool again. "
+                        "Continue without their name."
+                    ),
+                }
+
+            # Cap the number of times the popup can be raised per session as
+            # a defence in depth against a model that ignores the hints.
+            count = int(st.session_state.get("_name_popup_count", 0))
+            if count >= 2:
+                st.session_state["_name_popup_dismissed"] = True
+                return {
+                    "status": "rate_limited",
+                    "note": (
+                        "The name popup has been shown twice already with no "
+                        "result. Stopped re-raising it. Do not call this tool "
+                        "again."
+                    ),
+                }
+
+            # First (or second) request — actually raise the popup.
             st.session_state["_name_popup_pending"] = True
             st.session_state["_name_popup_reason"] = args.get("reason") or ""
+            st.session_state["_name_popup_count"] = count + 1
             return {
                 "status": "popup_opened",
-                "note": "A name input popup is being shown to the user. "
-                        "Continue your reply naturally; the name will be "
-                        "available on the next turn.",
+                "note": (
+                    "A name input popup is being shown to the user. "
+                    "Continue your reply naturally — do NOT call this tool "
+                    "again; the name will be available on the next turn if "
+                    "they answer."
+                ),
             }
 
         if name == "remember_lore":
