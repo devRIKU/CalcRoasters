@@ -1882,13 +1882,17 @@ def _maybe_show_name_popup() -> None:
                 )
 
             if save_clicked and name.strip():
-                # Persist the name + clear all popup state in one shot so
-                # the next script rerun sees a clean slate.
+                # Persist the name + clear popup state in one shot so the
+                # next script rerun sees a clean slate.
+                # NOTE: do NOT assign to st.session_state._name_popup_text_input
+                # here — Streamlit raises StreamlitAPIException when you mutate
+                # a widget's bound session_state key after the widget has been
+                # instantiated this run. The form is about to be torn down
+                # anyway (popup_pending=False), so there's nothing to clear.
                 st.session_state.user_name = name.strip()
                 lore_store.ensure_user(name.strip())
                 st.session_state._name_popup_pending = False
                 st.session_state._name_popup_reason = ""
-                st.session_state._name_popup_text_input = ""  # reset widget
                 # Force a FULL rerun (not fragment-scoped) — we need the
                 # chat container's next system_prompt build to pick up the
                 # new name, which is in the outer script's closure.
