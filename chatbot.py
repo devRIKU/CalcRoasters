@@ -37,6 +37,9 @@ from tts_free import (
     generate_speech_edge,
     generate_speech_gtts,
 )
+from ui.theme import inject_theme, set_personality
+from ui.chat_shell import render_header
+from ui.sidebar import render_identity_card, render_section_divider, render_mode_toggle
 
 try:
     from dotenv import load_dotenv
@@ -2114,12 +2117,30 @@ TTS_ENGINE_MAP = {
 
 
 def _sidebar_identity() -> None:
-    st.sidebar.markdown("**Who am I talking to?**")
+    # Dual-path: in Ethereal mode render the premium double-bezel identity
+    # card + eyebrow divider; in Classic mode keep the original bold
+    # markdown header to preserve the legacy look 1:1.
+    mode = st.session_state.get("_ui_mode", "ethereal")
+
+    if mode == "ethereal":
+        ctx = get_script_run_ctx()
+        session_id = (getattr(ctx, "session_id", "") or "")
+        render_identity_card(
+            user_name=st.session_state.get("user_name", ""),
+            session_id=session_id,
+        )
+        render_section_divider("Identity")
+        name_label_visibility = "collapsed"
+    else:
+        st.sidebar.markdown("**Who am I talking to?**")
+        name_label_visibility = "visible"
+
     typed = st.sidebar.text_input(
         "Your name",
         value=st.session_state.get("user_name", ""),
         key="user_name_input",
         placeholder="Tell me your name…",
+        label_visibility=name_label_visibility,
     )
     if typed and typed != st.session_state.get("user_name", ""):
         st.session_state.user_name = typed.strip()
@@ -2161,7 +2182,12 @@ def _sidebar_identity() -> None:
 
 
 def _sidebar_personality_and_brain() -> tuple[str, str]:
-    st.sidebar.markdown("**Personality**")
+    mode = st.session_state.get("_ui_mode", "ethereal")
+    if mode == "ethereal":
+        render_section_divider("Personality")
+    else:
+        st.sidebar.markdown("**Personality**")
+
     personality = st.sidebar.selectbox(
         "Select Personality",
         (
@@ -2176,12 +2202,20 @@ def _sidebar_personality_and_brain() -> tuple[str, str]:
         key="personality_selector",
         label_visibility="collapsed",
     )
+    # styles.apply_theme dispatches based on _ui_mode:
+    #   classic  → rewrites .streamlit/config.toml (original behavior, reload)
+    #   ethereal → only persists personality on session_state (CSS var swap)
     from styles import apply_theme
 
     apply_theme(personality)
+    set_personality(personality)
     st.sidebar.caption(PERSONALITY_CAPTION.get(personality, ""))
 
-    st.sidebar.markdown("**Brain Power**")
+    if mode == "ethereal":
+        render_section_divider("Brain Power")
+    else:
+        st.sidebar.markdown("**Brain Power**")
+
     brain_type = st.sidebar.selectbox(
         "Select Brain",
         ("Fast", "Thinker"),
@@ -2744,28 +2778,80 @@ def _show_initial_greeting(personality: str) -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Sanniva AI", page_icon="🤖")
-    st.title("Chat With Sanniva!")
-    st.sidebar.info(
-        "I am Sanniva's Digital Twin! I can help with anything — and yeah, I'll tease you when you ask for it."
+    # Two UIs ship in the same binary. The toggle at the top of the sidebar
+    # lets the user pick either:
+    #   - "ethereal" → new k-agency Ethereal Glass UI (custom HTML chrome
+    #                  + CSS variable-driven personality theming, no reloads)
+    #   - "classic"  → original Streamlit-native chrome (config.toml rewrite
+    #                  per personality, the pre-redesign behavior 1:1)
+    # The toggle widget itself must render BEFORE we read _ui_mode so the
+    # user's click takes effect on the same rerun.
+    st.set_page_config(
+        page_title="Sanniva — Ethereal Glass",
+        page_icon="✦",
+        layout="wide",
+        initial_sidebar_state="expanded",
     )
-
-    # Surface init errors so missing API keys are obvious instead of
-    # silently failing on first chat.
-    for err in _client_init_errors:
-        st.sidebar.error(f"⚠️ {err}")
 
     initialize_session_state()
     _show_os_greeting()
 
-    # --- Sidebar ---
+    # Surface init errors at the very top of the sidebar so missing API
+    # keys are obvious. Renders in both UI modes.
+    for err in _client_init_errors:
+        st.sidebar.error(f"⚠️ {err}")
+
+    # --- UI mode toggle (must be first) ---
+    mode = render_mode_toggle()
+
+    # In Ethereal mode, inject the premium theme NOW so every widget
+    # rendered below — sidebar selects, chat messages, input pill — paints
+    # restyled on the first frame. Skipped entirely in Classic mode so the
+    # native Streamlit chrome shows through untouched.
+    if mode == "ethereal":
+        inject_theme(st.session_state.get("_ui_personality", "Smart"))
+    else:
+        # Friendly sidebar info block that the original UI displayed under
+        # the title. In Ethereal mode this content is conveyed by the
+        # header subline + status pill instead.
+        st.sidebar.info(
+            "I am Sanniva's Digital Twin! I can help with anything — and "
+            "yeah, I'll tease you when you ask for it."
+        )
+
+    # --- Sidebar (both modes; widgets internally branch on _ui_mode) ---
     _sidebar_identity()
     _maybe_show_name_popup()
     personality, brain_type = _sidebar_personality_and_brain()
     temperature_val = _sidebar_model_settings()
     engine_label, voice, lang = _sidebar_tts()
 
-    # --- Main panel ---
+    # --- Main panel header ---
+    if mode == "ethereal":
+        # Re-inject with the resolved personality so orbs + accent shift.
+        # Streamlit dedupes by content hash so this is effectively free.
+        inject_theme(personality)
+
+        # Pick the first model in the active brain's fallback list for the
+        # HUD readout (the actual call may fall back to a later model but
+        # the pill reflects intent, which matches user expectation).
+        if brain_type == "Fast":
+            _model_chain = st.session_state.get("groq_models", DEFAULT_GROQ_MODELS)
+        else:
+            _model_chain = st.session_state.get("gemini_models", DEFAULT_GEMINI_MODELS)
+        _active_model = (_model_chain[0] if _model_chain else "—")
+        _model_short = _active_model.split("/")[-1].replace("-versatile", "").upper()
+        render_header(
+            personality=personality,
+            brain_type=brain_type,
+            model_id=_model_short,
+            user_name=st.session_state.get("user_name", ""),
+        )
+    else:
+        # Classic: the original bare title — preserved exactly.
+        st.title("Chat With Sanniva!")
+
+    # --- Conversation transcript (identical in both modes) ---
     display_chat_history()
     # Optimistic-update banner: shows "🔧 running tool…" the moment a tool
     # dispatch starts, even if the LLM stream is still going. Lives in its
