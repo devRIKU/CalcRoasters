@@ -701,18 +701,10 @@ def display_chat_history() -> None:
         avatar = get_avatar() if role == "assistant" else None
         with st.chat_message(role, avatar=avatar):
             st.markdown(msg.get("content", ""))
-        # Repaint the provider-attribution caption on historical assistant
-        # turns so it survives reruns. Captured during display_and_store.
-        if role == "assistant":
-            attribution = _format_provider_attribution(
-                msg.get("provider"), msg.get("elapsed_s"),
-            )
-            if attribution:
-                st.markdown(
-                    f"<div style='color:#888;font-size:0.8em;margin-top:-8px;"
-                    f"margin-bottom:8px;opacity:0.6;'>{attribution}</div>",
-                    unsafe_allow_html=True,
-                )
+        # Provider attribution footer was removed per UX feedback.
+        # Provenance is still queryable on msg["provider"] / msg["elapsed_s"]
+        # for the sidebar status pill + cache widget; it's just not painted
+        # under every bubble.
 
 
 # st.fragment lets a UI block rerun independently without reloading the
@@ -1010,21 +1002,14 @@ def display_and_store_response(
     # provider attribution caption in their place. Show which provider
     # actually served the turn (could be the failover, not the user's
     # preferred one) and how long it took.
+    # Clear both indicator slots — no per-message attribution footer.
     pre_indicator.empty()
+    post_indicator.empty()
+
+    # Still persist provenance on the message dict (silent — used by
+    # sidebar status pills + cache widget), but don't render it inline.
     provider_used = st.session_state.get("_last_used_provider")
     elapsed = (time.time() - turn_started_at) if turn_started_at else None
-    attribution = _format_provider_attribution(provider_used, elapsed)
-    if attribution:
-        post_indicator.markdown(
-            f"<div style='color:#888;font-size:0.8em;margin-top:4px;"
-            f"opacity:0.7;'>{attribution}</div>",
-            unsafe_allow_html=True,
-        )
-    else:
-        post_indicator.empty()
-
-    # Persist the attribution on the message dict so it survives reruns
-    # and gets rendered by display_chat_history on subsequent paints.
     msg_record: dict[str, Any] = {"role": "assistant", "content": full_text}
     if provider_used:
         msg_record["provider"] = provider_used
@@ -1330,24 +1315,40 @@ OS_GREETING = {
 }
 
 TOOL_GUIDANCE = (
-    "\n\n## Tools you can call\n"
-    "- `request_user_name`: open a popup asking the user for their name "
-    "ONLY if you don't already know it. Don't call it twice.\n"
-    "- `remember_lore`: store a short, concrete fact about the user whenever "
-    "they share something memorable (likes, family, hobbies, etc.). Set "
-    "`private: true` for sensitive info (address, phone, mental health, "
-    "religion, romantic interests, exam scores). Set `private: false` for "
-    "harmless preferences (favourite anime, food, hobbies).\n"
-    "- `recall_lore`: look up everything you remember about a named user.\n"
+    "\n\n## Available tools (CALL THEM — don't just describe what you'd do)\n"
+    "You have three function-calling tools wired in. When a trigger matches, "
+    "ACTUALLY EMIT the structured tool_call — don't just say in prose that "
+    "you'd remember something. Saying 'I'll remember that' without firing "
+    "remember_lore is a bug. Triggers below are STRONG SIGNALS — when you "
+    "see them, the tool MUST be called.\n"
     "\n"
-    "**IMPORTANT — write before tooling.** When you call any tool, you MUST "
-    "also write at least one short conversational sentence in the SAME "
-    "response (before the tool call), e.g. 'On it — let me check…' or "
-    "'Got it, saving that for next time.' The UI streams that sentence to "
-    "the user immediately and runs the tool in parallel, so the chat never "
-    "looks frozen. Never emit a silent tool call.\n"
-    "Be natural — don't announce *which* tool you're using, just say "
-    "something conversational that fits the moment.\n"
+    "### `remember_lore(user_name, fact, private)`\n"
+    "**Trigger:** the user shares ANY memorable fact about themselves — "
+    "a like, dislike, hobby, family member, music taste, school subject, "
+    "favourite food, anime, game, book, anything. Examples that MUST fire:\n"
+    "- 'I love Demon Slayer' → remember_lore(user_name=<their name>, fact='Loves Demon Slayer', private=false)\n"
+    "- 'My birthday is in October' → remember_lore(..., fact='Birthday is in October', private=true)\n"
+    "- 'I play guitar' → remember_lore(..., fact='Plays guitar', private=false)\n"
+    "Use `private=true` for sensitive info (address, phone, mental health, "
+    "religion, romantic interests, exam scores). Use `private=false` for "
+    "harmless preferences. When in doubt, prefer `private=true`.\n"
+    "\n"
+    "### `recall_lore(user_name)`\n"
+    "**Trigger:** the user asks 'what do you remember about me', 'do you "
+    "know X about me', or you need to reference past facts to answer well. "
+    "Call this BEFORE answering, then weave the result into your reply.\n"
+    "\n"
+    "### `request_user_name()`\n"
+    "**Trigger:** you don't yet know the user's name AND the conversation "
+    "has progressed past the first turn (don't ambush a new user). Call "
+    "AT MOST ONCE per session.\n"
+    "\n"
+    "### Reconciling with the persona doc\n"
+    "The persona section says 'don't announce that you're using tools' — "
+    "that's correct: don't write 'let me check my memory tool' or 'saving "
+    "to lore_store now'. But you DO still call the tool. The tool runs "
+    "silently in the background while your natural reply streams to the "
+    "user. Both happen on the same turn.\n"
 )
 
 
@@ -2905,6 +2906,46 @@ def get_ai_response_with_brain(
             base.append({"role": m["role"], "content": m.get("content", "")})
     base.append({"role": "user", "content": prompt})
 
+    # Manual override: if the user picked a specific provider+model in the
+    # sidebar, use ONLY that — skip the failover entirely. This is the
+    # escape hatch for "I want this exact model, period."
+    manual = st.session_state.get("_manual_model") or {}
+    manual_provider = manual.get("provider")
+    manual_model = manual.get("model")
+    if manual_provider and manual_model:
+        # Temporarily override the provider's model list with just the one
+        # the user picked. Restore on exit so the chain isn't permanently
+        # mutated.
+        state_key_map = {
+            "Cohere":     "cohere_models",
+            "Groq":       "groq_models",
+            "Gemini":     "gemini_models",
+            "OpenRouter": "openrouter_models",
+        }
+        state_key = state_key_map.get(manual_provider)
+        prev_models = st.session_state.get(state_key) if state_key else None
+        if state_key:
+            st.session_state[state_key] = [manual_model]
+        try:
+            response, attempts = _try_provider(
+                manual_provider, base, prompt, chat_history,
+                system_prompt, temperature, timeout, stream=stream,
+            )
+            if response is not None:
+                try:
+                    st.session_state["_last_used_provider"] = manual_provider
+                except Exception:
+                    pass
+                return response
+            # Manual model failed — surface that explicitly. Don't silently
+            # failover; the user picked this on purpose.
+            return _format_brain_error(
+                f"Manual override ({manual_provider}/{manual_model})", attempts,
+            )
+        finally:
+            if state_key and prev_models is not None:
+                st.session_state[state_key] = prev_models
+
     order = _provider_order_for_brain(brain_type)
     all_attempts: list[tuple[str, Exception]] = []
 
@@ -3116,22 +3157,7 @@ def _sidebar_personality_and_brain() -> tuple[str, str]:
         key="brain_selector",
         label_visibility="collapsed",
     )
-    # Brain Power is now a *preference* — the dispatcher always has access
-    # to all four providers and auto-fails-over across them. Fast just
-    # means "prefer Groq → OpenRouter → Cohere → Gemini"; Thinker flips
-    # the order to prefer Gemini for reasoning.
-    if brain_type == "Fast":
-        st.sidebar.caption(
-            "⚡ **Fast:** prefers ⚡Groq → 🎛️OpenRouter → 🪶Cohere → 🕵️Gemini. "
-            "Best for streaming chat, low latency, snappy first-token."
-        )
-    else:
-        st.sidebar.caption(
-            "🕵️ **Thinker:** prefers 🕵️Gemini → 🪶Cohere → 🎛️OpenRouter → ⚡Groq. "
-            "Best for deeper reasoning, hard questions, longer context."
-        )
-
-    # Show which providers are live this session (one tiny pill per provider).
+    # Compact provider-status pills only — no verbose caption above them.
     _sidebar_provider_status_pills()
     return personality, brain_type
 
@@ -3166,10 +3192,7 @@ def _sidebar_provider_status_pills() -> None:
             continue
         marker = "🟢" if name == last_used else "✅"
         pills.append(f"{emoji}{marker}")
-    st.sidebar.caption(
-        "Providers: " + "  ".join(pills)
-        + ("  •  last: " + last_used if last_used else "")
-    )
+    st.sidebar.caption("  ".join(pills))
 
 
 def _sidebar_model_settings() -> float:
@@ -3319,12 +3342,8 @@ def _sidebar_provider_picker(
     in the dispatcher.
     """
     st.sidebar.markdown(f"**{section_label}**")
-    if section_help:
-        st.sidebar.caption(section_help)
-
     if client is None:
-        st.sidebar.caption(f"⚠️ {provider} client not initialised — set the API key.")
-        # Still allow editing the chain (it'll be used when the key arrives).
+        st.sidebar.caption("⚠️ no key set")
 
     catalogue = catalogue_fetcher()
     custom_bucket_key = f"_custom_{provider.lower()}_models"
@@ -3341,66 +3360,120 @@ def _sidebar_provider_picker(
         options=options,
         default=current,
         key=f"{state_key}_picker",
-        help="Tried top-to-bottom. First success returns; failures fall through.",
+        label_visibility="collapsed",
     )
     if chosen:
         st.session_state[state_key] = chosen
     else:
-        st.sidebar.caption(f"⚠️ No {provider} model selected — falling back to defaults.")
         st.session_state[state_key] = list(default_models)
 
-    # Per-model warnings (e.g. Groq's low-TPM model).
+    # Per-model warnings (e.g. Groq's low-TPM model). Keep these — they
+    # convey real cost/perf info, not provider marketing.
     if extra_warnings:
         for m in st.session_state[state_key]:
             if m in extra_warnings:
                 st.sidebar.warning(f"`{m}`: {extra_warnings[m]}")
 
     # Custom model ID add field.
-    with st.sidebar.expander(f"➕ Add custom {provider} model", expanded=False):
-        st.caption(
-            f"For preview / private / paid models not in the live "
-            f"{provider} catalogue."
-        )
+    with st.sidebar.expander("➕ Add custom model", expanded=False):
         custom_id = st.text_input(
             "Model ID",
             key=f"{state_key}_custom_input",
             placeholder={
-                "Cohere": "e.g. command-r-08-2024",
-                "Groq": "e.g. llama-4-instruct",
-                "Gemini": "e.g. gemini-4-flash-preview",
-                "OpenRouter": "e.g. anthropic/claude-sonnet-4.5",
+                "Cohere":     "command-r-08-2024",
+                "Groq":       "llama-4-instruct",
+                "Gemini":     "gemini-4-flash-preview",
+                "OpenRouter": "anthropic/claude-sonnet-4.5",
             }.get(provider, "model-id"),
+            label_visibility="collapsed",
         )
         if st.button("Add", key=f"{state_key}_add_button"):
             mid = (custom_id or "").strip()
             if not mid:
-                st.warning("Empty model ID ignored.")
+                st.warning("Empty.")
             else:
                 bucket = st.session_state.setdefault(custom_bucket_key, [])
                 if mid in bucket:
-                    st.info(f"`{mid}` already in custom list.")
+                    st.info(f"`{mid}` already added.")
                 else:
                     bucket.append(mid)
-                    st.success(
-                        f"Added `{mid}`. Select it above to include in the chain."
-                    )
+                    st.success(f"Added `{mid}`.")
                     st.rerun()
+
+
+def _sidebar_manual_model_override() -> None:
+    """Optional manual selector — pin one specific model from any provider.
+
+    When set, the dispatcher uses ONLY this model and skips both the
+    per-provider chain AND the cross-provider failover. Failure surfaces
+    explicitly (no silent fallback) because the user picked this on
+    purpose. Set to "(auto)" to clear and resume normal failover.
+    """
+    st.sidebar.markdown("**Manual model override**")
+
+    # Build the full list of provider/model pairs from each catalogue +
+    # any custom additions the user made.
+    options: list[str] = ["(auto — use failover chain)"]
+    provider_specs = [
+        ("🪶 Cohere",     "Cohere",     fetch_cohere_catalogue,     "_custom_cohere_models",     DEFAULT_COHERE_MODELS,     cohere_client),
+        ("⚡ Groq",        "Groq",       fetch_groq_catalogue,       "_custom_groq_models",       DEFAULT_GROQ_MODELS,       groq_client),
+        ("🕵️ Gemini",     "Gemini",     fetch_gemini_catalogue,     "_custom_gemini_models",     DEFAULT_GEMINI_MODELS,     gemini_client),
+        ("🎛️ OpenRouter", "OpenRouter", fetch_openrouter_catalogue, "_custom_openrouter_models", DEFAULT_OPENROUTER_MODELS, openrouter_client),
+    ]
+    # Map from display label -> (provider_name, model_id).
+    label_lookup: dict[str, tuple[str, str]] = {}
+    for emoji_label, prov, fetcher, custom_key, defaults, client in provider_specs:
+        if client is None:
+            continue
+        catalogue = fetcher()
+        custom = st.session_state.get(custom_key, [])
+        merged = list(dict.fromkeys(list(catalogue) + list(custom)))
+        for m in merged:
+            display = f"{emoji_label}  ·  {m}"
+            options.append(display)
+            label_lookup[display] = (prov, m)
+
+    # Restore previous manual pick (display label) so the selector reflects state.
+    current_manual = st.session_state.get("_manual_model") or {}
+    current_label = "(auto — use failover chain)"
+    if current_manual.get("provider") and current_manual.get("model"):
+        target = (current_manual["provider"], current_manual["model"])
+        for lbl, pair in label_lookup.items():
+            if pair == target:
+                current_label = lbl
+                break
+
+    default_idx = options.index(current_label) if current_label in options else 0
+    picked = st.sidebar.selectbox(
+        "Pin a specific model",
+        options=options,
+        index=default_idx,
+        key="_manual_model_selector",
+        label_visibility="collapsed",
+        help=(
+            "When pinned, the dispatcher uses ONLY this model and skips "
+            "auto-failover. Errors surface immediately. Set to '(auto)' to "
+            "resume normal multi-provider failover."
+        ),
+    )
+    if picked == "(auto — use failover chain)":
+        st.session_state["_manual_model"] = None
+    else:
+        prov, mid = label_lookup[picked]
+        st.session_state["_manual_model"] = {"provider": prov, "model": mid}
 
 
 def _sidebar_model_chain_picker() -> None:
     """Picker UI for ALL four provider fallback chains.
 
-    Section order: Cohere → Groq → Gemini → OpenRouter (as requested).
-    Each section is independent — selecting fewer models in one provider
-    doesn't affect the others. The dispatcher walks PROVIDER_ORDER for
-    auto-failover when models within a provider all fail.
+    Section order: Cohere → Groq → Gemini → OpenRouter. Each section is
+    independent — selecting fewer models in one provider doesn't affect
+    the others.
     """
-    st.sidebar.markdown("**Model Fallback Chains**")
-    st.sidebar.caption(
-        "Each provider has its own chain. The dispatcher tries the brain's "
-        "preferred provider first, then auto-fails-over to the next provider "
-        "if all of its models fail."
-    )
+    # Manual override sits at the top — it's the most opinionated choice.
+    _sidebar_manual_model_override()
+
+    st.sidebar.markdown("**Fallback chains**")
 
     _sidebar_provider_picker(
         provider="Cohere",
@@ -3409,7 +3482,6 @@ def _sidebar_model_chain_picker() -> None:
         catalogue_fetcher=fetch_cohere_catalogue,
         client=cohere_client,
         section_label="🪶 Cohere",
-        section_help="Command family. Strong tool use, structured streaming.",
     )
 
     _sidebar_provider_picker(
@@ -3419,7 +3491,6 @@ def _sidebar_model_chain_picker() -> None:
         catalogue_fetcher=fetch_groq_catalogue,
         client=groq_client,
         section_label="⚡ Groq",
-        section_help="Fastest streaming. Llama / GPT-OSS / Mixtral families.",
         extra_warnings=LOW_TPM_GROQ_MODELS,
     )
 
@@ -3430,7 +3501,6 @@ def _sidebar_model_chain_picker() -> None:
         catalogue_fetcher=fetch_gemini_catalogue,
         client=gemini_client,
         section_label="🕵️ Gemini",
-        section_help="Best at deep reasoning. Non-streaming today.",
     )
 
     _sidebar_provider_picker(
@@ -3440,11 +3510,9 @@ def _sidebar_model_chain_picker() -> None:
         catalogue_fetcher=fetch_openrouter_catalogue,
         client=openrouter_client,
         section_label="🎛️ OpenRouter",
-        section_help="300+ models behind one key. Free tier shown by default; "
-                     "add paid models via the expander below.",
     )
 
-    if st.sidebar.button("🔄 Refresh model catalogues"):
+    if st.sidebar.button("🔄 Refresh catalogues"):
         fetch_groq_catalogue.clear()
         fetch_gemini_catalogue.clear()
         fetch_cohere_catalogue.clear()
