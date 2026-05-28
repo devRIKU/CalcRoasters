@@ -63,3 +63,4 @@ python-dotenv
 edge-tts
 gTTS
 firebase-admin
+cohere

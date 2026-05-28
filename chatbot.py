@@ -29,6 +29,20 @@ from groq import Groq
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 from user_agents import parse as ua_parse
 
+# OpenAI SDK is reused for OpenRouter (drop-in OpenAI-compatible endpoint).
+# Imported lazily inside _make_clients so a missing package doesn't crash
+# the app on import — the matching brain just gets disabled instead.
+try:
+    from openai import OpenAI as _OpenAIClient  # type: ignore
+except Exception:  # pragma: no cover
+    _OpenAIClient = None  # type: ignore
+
+# Cohere v2 client — same defensive import.
+try:
+    import cohere as _cohere  # type: ignore
+except Exception:  # pragma: no cover
+    _cohere = None  # type: ignore
+
 import lore_store
 import tools as ai_tools
 from tts_free import (
@@ -52,9 +66,16 @@ except ImportError:
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+COHERE_API_KEY = os.environ.get("COHERE_API_KEY")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY")
 FISH_AUDIO_API_KEY = os.environ.get("FISH_AUDIO_API_KEY")
 SILICON_FLOW_API_KEY = os.environ.get("SILICON_FLOW_API_KEY")
+# Optional referer headers required by OpenRouter for analytics/rankings.
+# Defaults are safe placeholders — override via env if you want OpenRouter
+# to attribute usage to your site/app.
+OPENROUTER_REFERER = os.environ.get("OPENROUTER_REFERER", "https://ai-sanniva.streamlit.app")
+OPENROUTER_TITLE = os.environ.get("OPENROUTER_TITLE", "Sanniva Digital Twin")
 
 # Current Groq production models (verified May 2026).
 # mixtral-8x7b-32768 was deprecated 2025-03-20; mixtral-7b never existed.
@@ -80,20 +101,45 @@ DEFAULT_GEMINI_MODELS = [
     "gemini-3-flash-preview",  # preview build of the 3.x flash line
     "gemini-3.1-flash-lite",  # cheapest, fastest fallback in the 3.x family
 ]
+# Cohere Command family — newest first. command-a-plus is the top-tier
+# (most capable, slightly slower); command-r-plus is the fallback (fast,
+# strong on tool-use). Both support v2 streaming + function calling.
+DEFAULT_COHERE_MODELS = [
+    "command-a-plus-05-2026",   # newest Command-A Plus, top capability
+    "command-r-plus-08-2024",   # older but reliable, strong tool use
+]
+# OpenRouter: free-tier-only by default to avoid surprise bills. The user
+# can add paid models via the sidebar's "Add custom model" expander; cost
+# telemetry will surface in the cache-savings widget so they see spend.
+DEFAULT_OPENROUTER_MODELS = [
+    "x-ai/grok-4-fast:free",
+    "openai/gpt-oss-120b:free",
+    "deepseek/deepseek-chat-v3.1:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+]
+# Provider ordering for auto-failover. If all models in the current
+# provider exhaust without producing text, the dispatcher walks to the
+# next provider in this list (subject to its client being initialised).
+# Order chosen so the fastest / most-likely-to-succeed providers come
+# first within each "brain power" tier.
+PROVIDER_ORDER = ["Cohere", "Groq", "Gemini", "OpenRouter"]
 AVATAR_PATH = "sanniva_face.jpg"
 
 
-def _make_clients() -> tuple[Any, Any, list[str]]:
-    """Build the Gemini + Groq clients independently. Returns
-    `(gemini_client, groq_client, error_messages)`. Either client can be
-    None — they're constructed in isolated try blocks so one failing
-    doesn't take the other down.
+def _make_clients() -> tuple[Any, Any, Any, Any, list[str]]:
+    """Build all four provider clients independently. Returns
+    `(gemini_client, groq_client, cohere_client, openrouter_client, error_messages)`.
+    Any client can be None — they're constructed in isolated try blocks so
+    one failing doesn't take the others down.
+
+    Order of construction doesn't matter; the dispatcher consults each one
+    independently and skips disabled providers gracefully.
     """
-    g_client = grq_client = None
+    g_client = grq_client = co_client = or_client = None
     errors: list[str] = []
 
     if not GOOGLE_API_KEY:
-        errors.append("`GOOGLE_API_KEY` not set — Thinker brain (Gemini) disabled.")
+        errors.append("`GOOGLE_API_KEY` not set — Gemini provider disabled.")
     else:
         try:
             g_client = genai.Client(api_key=GOOGLE_API_KEY)
@@ -101,17 +147,52 @@ def _make_clients() -> tuple[Any, Any, list[str]]:
             errors.append(f"Gemini init failed: {type(e).__name__}: {e}")
 
     if not GROQ_API_KEY:
-        errors.append("`GROQ_API_KEY` not set — Fast brain (Groq) disabled.")
+        errors.append("`GROQ_API_KEY` not set — Groq provider disabled.")
     else:
         try:
             grq_client = Groq(api_key=GROQ_API_KEY)
         except Exception as e:
             errors.append(f"Groq init failed: {type(e).__name__}: {e}")
 
-    return g_client, grq_client, errors
+    if not COHERE_API_KEY:
+        errors.append("`COHERE_API_KEY` not set — Cohere provider disabled.")
+    elif _cohere is None:
+        errors.append("`cohere` package missing — run `pip install cohere`.")
+    else:
+        try:
+            # Cohere v2 — newer streaming events, cleaner tool-use surface.
+            # ClientV2 is the actively-developed branch; v1 is legacy.
+            co_client = _cohere.ClientV2(api_key=COHERE_API_KEY)
+        except Exception as e:
+            errors.append(f"Cohere init failed: {type(e).__name__}: {e}")
+
+    if not OPENROUTER_API_KEY:
+        errors.append("`OPENROUTER_API_KEY` not set — OpenRouter provider disabled.")
+    elif _OpenAIClient is None:
+        errors.append("`openai` package missing — run `pip install openai`.")
+    else:
+        try:
+            # OpenRouter is OpenAI-API-compatible. We point the official
+            # openai SDK at its base URL instead of pulling in a second
+            # SDK — same wire shape as our Groq path so we can reuse the
+            # OpenAI-compat first-hop helper.
+            or_client = _OpenAIClient(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=OPENROUTER_API_KEY,
+                default_headers={
+                    # Optional ranking metadata; OpenRouter docs recommend
+                    # setting these so your app shows up in their listings.
+                    "HTTP-Referer": OPENROUTER_REFERER,
+                    "X-Title": OPENROUTER_TITLE,
+                },
+            )
+        except Exception as e:
+            errors.append(f"OpenRouter init failed: {type(e).__name__}: {e}")
+
+    return g_client, grq_client, co_client, or_client, errors
 
 
-gemini_client, groq_client, _client_init_errors = _make_clients()
+gemini_client, groq_client, cohere_client, openrouter_client, _client_init_errors = _make_clients()
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +270,96 @@ def fetch_gemini_catalogue() -> list[str]:
         return ids
     except Exception:
         return list(DEFAULT_GEMINI_MODELS)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_cohere_catalogue() -> list[str]:
+    """Return every Cohere chat-capable model ID. Falls back to
+    DEFAULT_COHERE_MODELS on any error.
+
+    The v2 SDK exposes `co.models.list(endpoint='chat')` for the chat
+    surface. We surface the raw `name` field as the model ID.
+    """
+    if cohere_client is None:
+        return list(DEFAULT_COHERE_MODELS)
+    try:
+        listing = cohere_client.models.list(endpoint="chat", page_size=100)
+        ids: list[str] = []
+        # Cohere returns a `ListModelsResponse` with `.models` field.
+        models = getattr(listing, "models", None) or []
+        for m in models:
+            mid = getattr(m, "name", None) or ""
+            if not mid:
+                continue
+            # Skip non-chat / embed / classify / rerank models defensively.
+            endpoints = getattr(m, "endpoints", None) or []
+            if endpoints and "chat" not in endpoints:
+                continue
+            ids.append(mid)
+        ids.sort()
+        for d in DEFAULT_COHERE_MODELS:
+            if d not in ids:
+                ids.insert(0, d)
+        return ids
+    except Exception:
+        return list(DEFAULT_COHERE_MODELS)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_openrouter_catalogue() -> list[str]:
+    """Return every chat-capable OpenRouter model ID. Falls back to
+    DEFAULT_OPENROUTER_MODELS on any error.
+
+    Pulled from the public `/api/v1/models` endpoint (no auth needed for
+    the listing). Filters to text-in / text-out chat models and pushes
+    free-tier models to the top so users see them first.
+    """
+    if openrouter_client is None:
+        return list(DEFAULT_OPENROUTER_MODELS)
+    try:
+        # The OpenAI SDK doesn't expose a typed `.models.list()` for
+        # OpenRouter's extended fields, so go direct via requests.
+        resp = requests.get(
+            "https://openrouter.ai/api/v1/models",
+            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return list(DEFAULT_OPENROUTER_MODELS)
+        data = resp.json().get("data") or []
+        free: list[str] = []
+        paid: list[str] = []
+        for m in data:
+            mid = m.get("id") or ""
+            if not mid:
+                continue
+            modality = (m.get("architecture") or {}).get("modality", "")
+            # We only want text→text chat models. Skip vision-only, audio,
+            # embedding, etc.
+            if modality and "text->text" not in modality:
+                continue
+            # Free models are identifiable by `:free` suffix OR zero
+            # prompt+completion pricing.
+            pricing = m.get("pricing") or {}
+            try:
+                is_free = (
+                    mid.endswith(":free")
+                    or (float(pricing.get("prompt", 1)) == 0
+                        and float(pricing.get("completion", 1)) == 0)
+                )
+            except Exception:
+                is_free = mid.endswith(":free")
+            (free if is_free else paid).append(mid)
+        free.sort()
+        paid.sort()
+        ids = free + paid
+        # Ensure curated defaults are in the list even if the API skipped them.
+        for d in DEFAULT_OPENROUTER_MODELS:
+            if d not in ids:
+                ids.insert(0, d)
+        return ids
+    except Exception:
+        return list(DEFAULT_OPENROUTER_MODELS)
 
 
 @st.cache_resource(show_spinner=False)
@@ -530,6 +701,18 @@ def display_chat_history() -> None:
         avatar = get_avatar() if role == "assistant" else None
         with st.chat_message(role, avatar=avatar):
             st.markdown(msg.get("content", ""))
+        # Repaint the provider-attribution caption on historical assistant
+        # turns so it survives reruns. Captured during display_and_store.
+        if role == "assistant":
+            attribution = _format_provider_attribution(
+                msg.get("provider"), msg.get("elapsed_s"),
+            )
+            if attribution:
+                st.markdown(
+                    f"<div style='color:#888;font-size:0.8em;margin-top:-8px;"
+                    f"margin-bottom:8px;opacity:0.6;'>{attribution}</div>",
+                    unsafe_allow_html=True,
+                )
 
 
 # st.fragment lets a UI block rerun independently without reloading the
@@ -695,19 +878,43 @@ def _word_chunk_stream(chunks, sink: list[str], delay: float = 0.012):
         yield buffer
 
 
+PROVIDER_EMOJI = {
+    "Groq": "⚡",
+    "Gemini": "🕵️",
+    "Cohere": "🪶",
+    "OpenRouter": "🎛️",
+}
+
+
+def _format_provider_attribution(provider: str | None, elapsed_s: float | None) -> str:
+    """Build the `via 🪶 Cohere · 1.2s` caption text shown under each
+    assistant turn. Returns empty string if we don't know who answered.
+    """
+    if not provider:
+        return ""
+    emoji = PROVIDER_EMOJI.get(provider, "🤖")
+    bits = [f"via {emoji} {provider}"]
+    if elapsed_s is not None and elapsed_s >= 0:
+        bits.append(f"{elapsed_s:.1f}s")
+    return " · ".join(bits)
+
+
 def display_and_store_response(
     response: "str | Iterator[str]",
     *,
     generating_phrase: str | None = None,
+    turn_started_at: float | None = None,
 ) -> str:
-    """Render an assistant response with a whimsical "generating" indicator.
+    """Render an assistant response with a whimsical "generating" indicator
+    and a provider-attribution footer.
 
     Lifecycle of the indicator (Claude-Code-style):
       1. BEFORE any token arrives → show `🌀 <generating_phrase>…` ABOVE the
          (empty) chat bubble so the user knows we're working.
       2. The FIRST token arrives → indicator moves BELOW the bubble (as a
          small italic caption) and the words start typing in.
-      3. The stream finishes → indicator is removed entirely.
+      3. The stream finishes → indicator is replaced with the provider
+         attribution caption (e.g. `via 🪶 Cohere · 1.2s`).
 
     The streaming animation is word-by-word with a small per-word delay
     (≈12 ms) so it feels like a typewriter even when the underlying LLM
@@ -799,13 +1006,31 @@ def display_and_store_response(
                     full_text = "".join(sink)
                     st.markdown(full_text or f"❌ Streaming error: {e}")
 
-    # Step 3: stream done — clear BOTH indicator slots.
+    # Step 3: stream done — clear the spinner indicators and render the
+    # provider attribution caption in their place. Show which provider
+    # actually served the turn (could be the failover, not the user's
+    # preferred one) and how long it took.
     pre_indicator.empty()
-    post_indicator.empty()
+    provider_used = st.session_state.get("_last_used_provider")
+    elapsed = (time.time() - turn_started_at) if turn_started_at else None
+    attribution = _format_provider_attribution(provider_used, elapsed)
+    if attribution:
+        post_indicator.markdown(
+            f"<div style='color:#888;font-size:0.8em;margin-top:4px;"
+            f"opacity:0.7;'>{attribution}</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        post_indicator.empty()
 
-    st.session_state.setdefault("messages", []).append(
-        {"role": "assistant", "content": full_text}
-    )
+    # Persist the attribution on the message dict so it survives reruns
+    # and gets rendered by display_chat_history on subsequent paints.
+    msg_record: dict[str, Any] = {"role": "assistant", "content": full_text}
+    if provider_used:
+        msg_record["provider"] = provider_used
+    if elapsed is not None:
+        msg_record["elapsed_s"] = elapsed
+    st.session_state.setdefault("messages", []).append(msg_record)
     return full_text
 
 
@@ -1408,25 +1633,31 @@ def _strip_inline_tool_noise(text: str) -> str:
     return cleaned.strip()
 
 
-def _record_cache_usage(response: Any, *, model: str = "", hop: str = "") -> None:
-    """Pull Groq's prompt-cache hit metrics off a chat completion response
-    and stash them in session_state so the sidebar can show savings.
+def _record_cache_usage(
+    response: Any, *, model: str = "", hop: str = "", provider: str = "Groq",
+) -> None:
+    """Pull prompt-cache hit metrics off an OpenAI-shaped chat completion
+    response and stash them in session_state so the sidebar can show
+    savings, broken down per provider.
 
     Groq returns `usage.prompt_tokens_details.cached_tokens` on every
-    completion. A hit means we paid 50% for those tokens instead of full
-    price (their automatic caching, no opt-in needed — we just need the
-    prefix to stay deterministic, which is what the prompt-building
-    refactor above is for).
+    completion. OpenRouter (via the OpenAI SDK) returns the same shape.
+    Cohere uses a different shape and goes through `_record_cohere_usage`
+    instead. Gemini's cache stats live on `response.usage_metadata.cached_content_token_count`
+    and aren't captured yet.
 
-    Stored shape (session_state['_groq_cache_stats']):
+    Stored shape (session_state['_provider_cache_stats'][provider]):
         {
-          'total_prompt_tokens': int,   # cumulative across session
-          'total_cached_tokens': int,   # cumulative across session
+          'total_prompt_tokens': int,
+          'total_cached_tokens': int,
           'last_prompt_tokens': int,
           'last_cached_tokens': int,
           'last_model': str,
           'last_hop': str,
         }
+
+    Also maintains the legacy `_groq_cache_stats` key for backwards
+    compatibility with anything still reading it.
     """
     try:
         usage = getattr(response, "usage", None)
@@ -1447,7 +1678,9 @@ def _record_cache_usage(response: Any, *, model: str = "", hop: str = "") -> Non
             if isinstance(d, dict):
                 cached = int(d.get("cached_tokens", 0) or 0)
 
-        stats = st.session_state.setdefault("_groq_cache_stats", {
+        # New per-provider store.
+        all_stats = st.session_state.setdefault("_provider_cache_stats", {})
+        stats = all_stats.setdefault(provider, {
             "total_prompt_tokens": 0,
             "total_cached_tokens": 0,
             "last_prompt_tokens": 0,
@@ -1461,6 +1694,39 @@ def _record_cache_usage(response: Any, *, model: str = "", hop: str = "") -> Non
         stats["last_cached_tokens"] = int(cached)
         stats["last_model"] = model
         stats["last_hop"] = hop
+
+        # OpenRouter exposes `usage.cost` (USD) on every completion. Free
+        # models report 0.0; paid models report the real dollar cost. We
+        # accumulate it so the sidebar can surface running spend.
+        if provider == "OpenRouter":
+            cost = 0.0
+            try:
+                if isinstance(usage, dict):
+                    cost = float(usage.get("cost", 0) or 0)
+                else:
+                    cost = float(getattr(usage, "cost", 0) or 0)
+            except Exception:
+                cost = 0.0
+            stats.setdefault("total_cost_usd", 0.0)
+            stats["total_cost_usd"] = float(stats["total_cost_usd"]) + cost
+            stats["last_cost_usd"] = cost
+
+        # Legacy mirror for the existing Groq-only sidebar code path.
+        if provider == "Groq":
+            legacy = st.session_state.setdefault("_groq_cache_stats", {
+                "total_prompt_tokens": 0,
+                "total_cached_tokens": 0,
+                "last_prompt_tokens": 0,
+                "last_cached_tokens": 0,
+                "last_model": "",
+                "last_hop": "",
+            })
+            legacy["total_prompt_tokens"] += int(prompt_tokens)
+            legacy["total_cached_tokens"] += int(cached)
+            legacy["last_prompt_tokens"] = int(prompt_tokens)
+            legacy["last_cached_tokens"] = int(cached)
+            legacy["last_model"] = model
+            legacy["last_hop"] = hop
     except Exception:
         # Cache telemetry must never break a turn.
         pass
@@ -1914,6 +2180,696 @@ def _groq_run_tools_then_stream(
     )
 
 
+# ---------------------------------------------------------------------------
+# OpenAI-compatible helpers (shared between Groq and OpenRouter)
+# ---------------------------------------------------------------------------
+# These mirror the _groq_* functions above but take the client as a
+# parameter. The Groq path keeps its dedicated helpers (so we don't
+# disturb the existing streaming UX), while OpenRouter (which speaks the
+# same OpenAI wire format) uses these. The duplication is intentional —
+# the Groq SDK and the OpenAI SDK differ in a few subtle places (header
+# defaults, timeout types) that aren't worth abstracting.
+
+
+def _openrouter_extra_body() -> dict:
+    """OpenRouter-specific request extensions.
+
+    Asks OpenRouter to include the `cost` field on `usage` so we can
+    track running spend in the sidebar. This is OpenRouter's documented
+    way to enable the cost field — it's off by default to keep responses
+    small for the common case.
+    """
+    return {
+        # `usage: {include: true}` was the v1 syntax; current OpenRouter
+        # docs use this object form. Including it forces the upstream
+        # router to attach cost/latency/etc on top of the OpenAI usage.
+        "usage": {"include": True},
+    }
+
+
+def _openai_first_hop_discover(
+    client: Any,
+    model: str,
+    messages: list,
+    timeout_seconds: float,
+    *,
+    provider_label: str = "openai",
+) -> tuple[list, str, list[dict]]:
+    """First-hop tool discovery for any OpenAI-compatible client.
+
+    Mirrors `_groq_first_hop_discover` byte-for-byte except the client is
+    passed in. Raises on transport errors so the outer fallback loop can
+    move to the next model.
+    """
+    create_kwargs = dict(
+        messages=messages,
+        model=model,
+        tools=get_openai_tools_cached(),
+        tool_choice="auto",
+        timeout=timeout_seconds,
+        max_completion_tokens=1500,
+    )
+    # OpenRouter needs an opt-in to surface its cost field on usage.
+    if provider_label == "OpenRouter":
+        create_kwargs["extra_body"] = _openrouter_extra_body()
+    try:
+        response = client.chat.completions.create(**create_kwargs)
+    except TypeError:
+        # Older openai SDKs reject `extra_body` — retry without it.
+        create_kwargs.pop("extra_body", None)
+        response = client.chat.completions.create(**create_kwargs)
+    _record_cache_usage(response, model=model, hop=f"{provider_label}/first-hop", provider=provider_label)
+    msg = response.choices[0].message
+    content = msg.content or ""
+    tool_calls = getattr(msg, "tool_calls", None) or []
+    normalised = [
+        {
+            "id": tc.id,
+            "name": tc.function.name,
+            "arguments": tc.function.arguments or "{}",
+        }
+        for tc in tool_calls
+    ]
+    if not normalised:
+        inline_calls, cleaned = _extract_inline_tool_calls(content)
+        if inline_calls:
+            normalised = inline_calls
+            content = cleaned
+
+    if not normalised and not content.strip():
+        raise RuntimeError(f"{model} returned empty content")
+
+    return messages, _strip_inline_tool_noise(content), normalised
+
+
+def _openai_stream_final(
+    client: Any,
+    model: str,
+    messages: list,
+    timeout_seconds: float,
+    *,
+    provider_label: str = "openai",
+) -> Iterator[str]:
+    """Streaming final-synthesis pass for any OpenAI-compatible client.
+
+    Mirrors `_stream_groq_final` but with the client injected. Same
+    `stream_options={"include_usage": True}` so we can record cache hits.
+    OpenRouter (and Groq) both honour this; if a downstream model doesn't,
+    we just don't get usage telemetry — content streaming still works.
+    """
+    # OpenRouter / OpenAI SDK takes `extra_body` for non-standard fields
+    # but `stream_options` is a top-level OpenAI field. Both providers
+    # accept it directly. For OpenRouter we also opt into the `cost`
+    # field on the usage block via extra_body.
+    stream_kwargs = dict(
+        messages=messages,
+        model=model,
+        timeout=timeout_seconds,
+        max_completion_tokens=1500,
+        stream=True,
+        stream_options={"include_usage": True},
+    )
+    if provider_label == "OpenRouter":
+        stream_kwargs["extra_body"] = _openrouter_extra_body()
+
+    try:
+        stream = client.chat.completions.create(**stream_kwargs)
+    except TypeError:
+        # Some openai SDK versions don't accept stream_options or
+        # extra_body — retry without the optional knobs.
+        stream_kwargs.pop("stream_options", None)
+        stream_kwargs.pop("extra_body", None)
+        stream = client.chat.completions.create(**stream_kwargs)
+
+    last_chunk = None
+    for chunk in stream:
+        last_chunk = chunk
+        try:
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+            delta = choices[0].delta
+            piece = getattr(delta, "content", None)
+        except Exception:
+            piece = None
+        if piece:
+            yield piece
+    if last_chunk is not None:
+        _record_cache_usage(last_chunk, model=model, hop=f"{provider_label}/stream-final", provider=provider_label)
+
+
+def _openai_stream_with_parallel_tools(
+    client: Any,
+    model: str,
+    messages: list,
+    prose: str,
+    calls: list[dict],
+    timeout_seconds: float,
+    *,
+    provider_label: str = "openai",
+) -> Iterator[str]:
+    """Mirror of _groq_stream_with_parallel_tools for any OpenAI-compatible
+    client. Yields the leading prose immediately, runs tools in parallel,
+    then streams the synthesis.
+    """
+    if prose:
+        yield prose
+        yield "\n\n"
+
+    messages.append(
+        {
+            "role": "assistant",
+            "content": prose,
+            "tool_calls": [
+                {
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                }
+                for tc in calls
+            ],
+        }
+    )
+
+    completed = ai_tools.dispatch_parallel(calls)
+    for tc in completed:
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "name": tc["name"],
+                "content": tc["content"],
+            }
+        )
+
+    yield from _openai_stream_final(
+        client, model, messages, timeout_seconds, provider_label=provider_label,
+    )
+
+
+def _openai_chat_with_tools(
+    client: Any,
+    model: str,
+    messages: list,
+    timeout_seconds: float,
+    *,
+    provider_label: str = "openai",
+) -> str:
+    """Non-streaming OpenAI-compatible chat with tool-calling loop.
+
+    Mirror of `_groq_chat_with_tools` parameterised by client. Used when
+    the caller doesn't want a stream (i.e. when this provider is acting
+    as the Thinker brain rather than Fast brain).
+    """
+    for hop in range(MAX_TOOL_HOPS):
+        kwargs = dict(
+            messages=messages,
+            model=model,
+            timeout=timeout_seconds,
+            max_completion_tokens=1500,
+        )
+        if hop == 0:
+            kwargs["tools"] = get_openai_tools_cached()
+            kwargs["tool_choice"] = "auto"
+        response = client.chat.completions.create(**kwargs)
+        _record_cache_usage(
+            response, model=model,
+            hop=f"{provider_label}/chat-with-tools/hop-{hop}",
+            provider=provider_label,
+        )
+        try:
+            msg = response.choices[0].message
+        except Exception:
+            return str(response) or "No response generated."
+
+        content = msg.content or ""
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        normalised = [
+            {
+                "id": tc.id,
+                "name": tc.function.name,
+                "arguments": tc.function.arguments or "{}",
+            }
+            for tc in tool_calls
+        ]
+        if not normalised:
+            inline_calls, cleaned = _extract_inline_tool_calls(content)
+            if inline_calls:
+                normalised = inline_calls
+                content = cleaned
+
+        if not normalised:
+            return _strip_inline_tool_noise(content) or "No response generated."
+
+        messages.append(
+            {
+                "role": "assistant",
+                "content": content,
+                "tool_calls": [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                    }
+                    for tc in normalised
+                ],
+            }
+        )
+        for tc in ai_tools.dispatch_parallel(normalised):
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "name": tc["name"],
+                    "content": tc["content"],
+                }
+            )
+
+    # Last-ditch streaming pass with tools disabled.
+    try:
+        chunks = list(
+            _openai_stream_final(
+                client, model, messages, timeout_seconds,
+                provider_label=provider_label,
+            )
+        )
+        final = "".join(chunks).strip()
+        if final:
+            return final
+    except Exception as e:
+        print(f"[{provider_label}] final stream failed on {model}: {e}", file=sys.stderr)
+    return "Hmm, I got tangled up calling tools. Try asking again."
+
+
+# ---------------------------------------------------------------------------
+# Cohere brain (v2 streaming + tool use)
+# ---------------------------------------------------------------------------
+# Cohere's wire format is OpenAI-ish but with enough quirks (different
+# event types, different tool-result message shape) that it gets its own
+# implementation rather than sharing the OpenAI-compat helpers above.
+
+
+def _cohere_translate_tools() -> list[dict]:
+    """Convert OPENAI_TOOLS into Cohere v2's tool schema.
+
+    Cohere v2 accepts OpenAI-shaped tool schemas directly — the v2 API
+    spec mirrors OpenAI's `{"type": "function", "function": {...}}` shape.
+    We pass the cached OpenAI tools through with no transformation, but
+    keep this function as the seam for any future divergence.
+    """
+    return get_openai_tools_cached()
+
+
+def _cohere_first_hop_discover(
+    model: str, messages: list, timeout_seconds: float,
+) -> tuple[list, str, list[dict]]:
+    """Cohere v2 first hop: non-streaming, tool-discovery only.
+
+    Returns `(messages, prose, calls)` matching the contract of
+    `_openai_first_hop_discover` so the parallel-tools-with-streaming
+    generator below can be a thin wrapper.
+    """
+    # Cohere ClientV2.chat() is the non-streaming endpoint.
+    response = cohere_client.chat(
+        model=model,
+        messages=messages,
+        tools=_cohere_translate_tools(),
+        max_tokens=1500,
+        # request_options is the cohere SDK's per-call timeout knob.
+        request_options={"timeout_in_seconds": timeout_seconds},
+    )
+
+    _record_cohere_usage(response, model=model, hop="cohere/first-hop")
+
+    # Cohere v2 response: response.message.content is a list of content
+    # blocks (text, tool_call, etc). response.message.tool_calls is the
+    # structured tool-call list when the model invoked tools.
+    msg_obj = getattr(response, "message", None)
+    if msg_obj is None:
+        raise RuntimeError(f"{model} returned no message")
+
+    # Extract text content.
+    text_pieces: list[str] = []
+    content_blocks = getattr(msg_obj, "content", None) or []
+    for blk in content_blocks:
+        t = getattr(blk, "type", None) or (blk.get("type") if isinstance(blk, dict) else None)
+        if t == "text":
+            piece = (
+                getattr(blk, "text", None)
+                if not isinstance(blk, dict)
+                else blk.get("text")
+            )
+            if piece:
+                text_pieces.append(piece)
+    prose = "".join(text_pieces)
+
+    # Extract tool calls.
+    tc_list = getattr(msg_obj, "tool_calls", None) or []
+    normalised: list[dict] = []
+    for tc in tc_list:
+        tc_id = getattr(tc, "id", None) or (tc.get("id") if isinstance(tc, dict) else None)
+        fn = getattr(tc, "function", None) or (tc.get("function") if isinstance(tc, dict) else None)
+        if fn is None:
+            continue
+        name = getattr(fn, "name", None) or (fn.get("name") if isinstance(fn, dict) else None)
+        args = getattr(fn, "arguments", None) or (fn.get("arguments") if isinstance(fn, dict) else None)
+        if not name:
+            continue
+        normalised.append({
+            "id": tc_id or f"cohere_{len(normalised)}",
+            "name": name,
+            "arguments": args or "{}",
+        })
+
+    # Fallback: pseudo-XML in text content.
+    if not normalised and prose:
+        inline_calls, cleaned = _extract_inline_tool_calls(prose)
+        if inline_calls:
+            normalised = inline_calls
+            prose = cleaned
+
+    if not normalised and not prose.strip():
+        raise RuntimeError(f"{model} returned empty content")
+
+    return messages, _strip_inline_tool_noise(prose), normalised
+
+
+def _cohere_stream_final(
+    model: str, messages: list, timeout_seconds: float,
+) -> Iterator[str]:
+    """Stream Cohere's final synthesis (tools off).
+
+    Cohere v2 streaming emits `content-delta` events that carry the next
+    text token in `event.delta.message.content.text`. We yield those
+    pieces and ignore the rest of the event types (message-start,
+    content-start, message-end, etc).
+    """
+    stream = cohere_client.chat_stream(
+        model=model,
+        messages=messages,
+        max_tokens=1500,
+        request_options={"timeout_in_seconds": timeout_seconds},
+    )
+    last_event = None
+    for event in stream:
+        last_event = event
+        try:
+            etype = getattr(event, "type", None)
+            if etype != "content-delta":
+                continue
+            delta = getattr(event, "delta", None)
+            if delta is None:
+                continue
+            msg = getattr(delta, "message", None)
+            if msg is None:
+                continue
+            content = getattr(msg, "content", None)
+            if content is None:
+                continue
+            piece = getattr(content, "text", None)
+        except Exception:
+            piece = None
+        if piece:
+            yield piece
+
+    # Cohere's last event is `message-end` which carries usage info.
+    if last_event is not None:
+        _record_cohere_usage(last_event, model=model, hop="cohere/stream-final")
+
+
+def _cohere_stream_with_parallel_tools(
+    model: str, messages: list, prose: str, calls: list[dict], timeout_seconds: float,
+) -> Iterator[str]:
+    """Cohere version of the prose-first parallel-tools streamer.
+
+    Same shape as `_openai_stream_with_parallel_tools` but feeds tool
+    results back in Cohere's preferred format: a `tool` role message
+    carrying the JSON content.
+    """
+    if prose:
+        yield prose
+        yield "\n\n"
+
+    # Cohere v2 wants the assistant turn that issued the tool calls in
+    # its history. Same shape as OpenAI's tool_calls field.
+    messages.append(
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                }
+                for tc in calls
+            ],
+            # Cohere requires a non-null `content` field; empty list is OK.
+            "content": prose or "",
+        }
+    )
+
+    completed = ai_tools.dispatch_parallel(calls)
+    for tc in completed:
+        # Cohere v2 tool-result message shape: role="tool", tool_call_id,
+        # content (string of the JSON result).
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "content": tc["content"],
+            }
+        )
+
+    yield from _cohere_stream_final(model, messages, timeout_seconds)
+
+
+def _cohere_chat_with_tools(
+    model: str, messages: list, timeout_seconds: float,
+) -> str:
+    """Non-streaming Cohere chat with bounded tool-calling loop.
+
+    Used when the caller wants a single string back (matching the older
+    Gemini brain's non-streaming contract). Internally still uses the
+    streaming final pass and concatenates.
+    """
+    for hop in range(MAX_TOOL_HOPS):
+        if hop == 0:
+            messages, prose, normalised = _cohere_first_hop_discover(
+                model, messages, timeout_seconds,
+            )
+        else:
+            # Subsequent hops: ask Cohere to synthesise without tools.
+            chunks = list(_cohere_stream_final(model, messages, timeout_seconds))
+            text = "".join(chunks).strip()
+            return text or "No response generated."
+
+        if not normalised:
+            return prose or "No response generated."
+
+        messages.append(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                    }
+                    for tc in normalised
+                ],
+                "content": prose or "",
+            }
+        )
+        for tc in ai_tools.dispatch_parallel(normalised):
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": tc["content"],
+                }
+            )
+
+    return "Hmm, I got tangled up calling tools. Try asking again."
+
+
+def _record_cohere_usage(obj: Any, *, model: str = "", hop: str = "") -> None:
+    """Pull Cohere's token usage off a chat response or message-end event.
+
+    Cohere v2 exposes `response.usage.tokens.{input_tokens, output_tokens}`
+    and `response.usage.billed_units.{input_tokens, output_tokens}`. There
+    is no documented cached_tokens field on Cohere v2 yet, so we record
+    plain input/output counts and leave cached at 0.
+    """
+    try:
+        usage = (
+            getattr(obj, "usage", None)
+            or getattr(getattr(obj, "delta", None), "usage", None)
+        )
+        if usage is None:
+            return
+        tokens = getattr(usage, "tokens", None) or getattr(usage, "billed_units", None)
+        if tokens is None:
+            return
+        input_t = getattr(tokens, "input_tokens", 0) or 0
+        # Round to int defensively (Cohere returns floats sometimes).
+        input_t = int(input_t)
+        stats = st.session_state.setdefault("_provider_cache_stats", {}).setdefault(
+            "Cohere",
+            {
+                "total_prompt_tokens": 0,
+                "total_cached_tokens": 0,
+                "last_prompt_tokens": 0,
+                "last_cached_tokens": 0,
+                "last_model": "",
+                "last_hop": "",
+            },
+        )
+        stats["total_prompt_tokens"] += input_t
+        stats["last_prompt_tokens"] = input_t
+        stats["last_model"] = model
+        stats["last_hop"] = hop
+    except Exception:
+        pass
+
+
+def _provider_order_for_brain(brain_type: str) -> list[str]:
+    """Return providers in preferred try-order for the given brain power.
+
+    Both brain types ultimately walk all 4 providers — the difference is
+    just *which provider is tried first*. The auto-failover then walks
+    the rest in order.
+
+    Fast: prefer Groq (fastest streaming) → OpenRouter → Cohere → Gemini.
+    Thinker: prefer Gemini (best reasoning) → Cohere → OpenRouter → Groq.
+    """
+    if brain_type == "Thinker":
+        return ["Gemini", "Cohere", "OpenRouter", "Groq"]
+    # Fast (default)
+    return ["Groq", "OpenRouter", "Cohere", "Gemini"]
+
+
+def _provider_models(provider: str) -> list[str]:
+    """Get the user-configured (or default) model chain for a provider."""
+    key_map = {
+        "Groq":       ("groq_models",       DEFAULT_GROQ_MODELS),
+        "Gemini":     ("gemini_models",     DEFAULT_GEMINI_MODELS),
+        "Cohere":     ("cohere_models",     DEFAULT_COHERE_MODELS),
+        "OpenRouter": ("openrouter_models", DEFAULT_OPENROUTER_MODELS),
+    }
+    state_key, default = key_map.get(provider, ("", []))
+    return getattr(st.session_state, state_key, default) if state_key else list(default)
+
+
+def _provider_client(provider: str) -> Any:
+    """Return the initialised client for a provider, or None if disabled."""
+    return {
+        "Groq": groq_client,
+        "Gemini": gemini_client,
+        "Cohere": cohere_client,
+        "OpenRouter": openrouter_client,
+    }.get(provider)
+
+
+def _try_provider(
+    provider: str,
+    base_messages: list,
+    prompt: str,
+    chat_history: list,
+    system_prompt: str,
+    temperature: float,
+    timeout: float,
+    *,
+    stream: bool,
+) -> tuple[Any, list[tuple[str, Exception]]]:
+    """Attempt every model in `provider`'s chain. Returns
+    `(response_or_None, attempts)`.
+
+    A non-None response means a model succeeded — return immediately.
+    A None response means every model in this provider failed; caller
+    should move on to the next provider in the failover list.
+    """
+    attempts: list[tuple[str, Exception]] = []
+    client = _provider_client(provider)
+    if client is None:
+        attempts.append((f"{provider}/-", RuntimeError(f"{provider} client not initialised")))
+        return None, attempts
+
+    models = _provider_models(provider)
+    if not models:
+        attempts.append((f"{provider}/-", RuntimeError(f"No {provider} models selected")))
+        return None, attempts
+
+    for model in models:
+        try:
+            # OpenAI-shape providers (Groq + OpenRouter) share the same
+            # helpers; we just pick which client + label to pass through.
+            if provider == "Groq":
+                if stream:
+                    msgs = list(base_messages)
+                    msgs, prose, calls = _groq_first_hop_discover(model, msgs, timeout)
+                    if not calls:
+                        return iter([prose]), attempts
+                    return _groq_stream_with_parallel_tools(
+                        model, msgs, prose, calls, timeout,
+                    ), attempts
+                return _groq_chat_with_tools(model, list(base_messages), timeout), attempts
+
+            if provider == "OpenRouter":
+                if stream:
+                    msgs = list(base_messages)
+                    msgs, prose, calls = _openai_first_hop_discover(
+                        openrouter_client, model, msgs, timeout,
+                        provider_label="OpenRouter",
+                    )
+                    if not calls:
+                        return iter([prose]), attempts
+                    return _openai_stream_with_parallel_tools(
+                        openrouter_client, model, msgs, prose, calls, timeout,
+                        provider_label="OpenRouter",
+                    ), attempts
+                return _openai_chat_with_tools(
+                    openrouter_client, model, list(base_messages), timeout,
+                    provider_label="OpenRouter",
+                ), attempts
+
+            if provider == "Cohere":
+                if stream:
+                    msgs = list(base_messages)
+                    msgs, prose, calls = _cohere_first_hop_discover(model, msgs, timeout)
+                    if not calls:
+                        return iter([prose]), attempts
+                    return _cohere_stream_with_parallel_tools(
+                        model, msgs, prose, calls, timeout,
+                    ), attempts
+                return _cohere_chat_with_tools(model, list(base_messages), timeout), attempts
+
+            if provider == "Gemini":
+                # Gemini takes a different shape — it has its own
+                # `system_instruction` + Content[] history rather than
+                # OpenAI messages[]. Build the legacy concatenated prompt.
+                ctx_parts = [
+                    f"{'User' if m.get('role') == 'user' else 'Assistant'}: {m.get('content')}"
+                    for m in chat_history[-6:]
+                    if m.get("role") in ("user", "assistant")
+                ]
+                full_prompt = "\n\n".join(ctx_parts + [f"User: {prompt}"])
+                # Gemini is non-streaming today; the UI wraps the returned
+                # string into the typewriter animation.
+                return _gemini_chat_with_tools(
+                    model, system_prompt, full_prompt, temperature, timeout,
+                ), attempts
+
+            attempts.append((f"{provider}/{model}", RuntimeError(f"Unknown provider {provider}")))
+        except Exception as e:
+            attempts.append((f"{provider}/{model}", e))
+            print(
+                f"[{provider}] {model} failed: {type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+            continue
+    return None, attempts
+
+
 def get_ai_response_with_brain(
     prompt: str,
     system_prompt: str,
@@ -1923,91 +2879,63 @@ def get_ai_response_with_brain(
     *,
     stream: bool = False,
 ):
-    """Call the selected brain (Fast=Groq, Thinker=Gemini) with model fallback.
+    """Call the selected brain power, with automatic failover across ALL
+    four providers (Cohere, Groq, Gemini, OpenRouter).
 
-    With stream=True (Fast brain only), returns an Iterator[str] of text chunks
-    instead of a single string, so the UI can render tokens as they arrive.
+    `brain_type` is now just a quality preference ('Fast' or 'Thinker') —
+    it picks which provider to try FIRST. If that provider's models all
+    fail, we walk the remaining three in order before giving up. This
+    means a key outage on any single provider is invisible to the user.
+
+    With stream=True, returns an Iterator[str] of text chunks for the
+    UI's word-by-word animation. With stream=False, returns a finished
+    string. Both work for any provider (Gemini is non-stream and gets
+    wrapped into an iterator at the call site).
     """
-    # Realistic default: 70B Groq models with tool calling + ~17kB system
-    # prompt routinely take 5–8s on first hit. Gemini "thinking" models can
-    # take 10–20s. Anything under 20s is asking for spurious timeouts.
+    # Realistic default: large models with tool calling + ~10kB system
+    # prompt routinely take 5–15s. Cohere Command-A can hit ~25s. Anything
+    # under 20s causes spurious timeouts.
     timeout = getattr(st.session_state, "fallback_timeout", 25)
 
-    if brain_type == "Fast":
-        if groq_client is None:
-            return "❌ Groq client not initialized. Set `GROQ_API_KEY` in your environment."
-        base = [{"role": "system", "content": system_prompt}]
-        for m in chat_history[-6:]:
-            if m.get("role") in ("user", "assistant"):
-                base.append({"role": m["role"], "content": m.get("content", "")})
-        base.append({"role": "user", "content": prompt})
+    # OpenAI-shape base message list (used by Groq, OpenRouter, Cohere).
+    # Gemini's branch ignores this and builds its own from chat_history.
+    base = [{"role": "system", "content": system_prompt}]
+    for m in chat_history[-6:]:
+        if m.get("role") in ("user", "assistant"):
+            base.append({"role": m["role"], "content": m.get("content", "")})
+    base.append({"role": "user", "content": prompt})
 
-        attempts: list[tuple[str, Exception]] = []
-        models = getattr(st.session_state, "groq_models", DEFAULT_GROQ_MODELS)
-        for model in models:
+    order = _provider_order_for_brain(brain_type)
+    all_attempts: list[tuple[str, Exception]] = []
+
+    for provider in order:
+        response, attempts = _try_provider(
+            provider,
+            base,
+            prompt,
+            chat_history,
+            system_prompt,
+            temperature,
+            timeout,
+            stream=stream,
+        )
+        all_attempts.extend(attempts)
+        if response is not None:
+            # Note in the sidebar status banner which provider served the turn.
             try:
-                if stream:
-                    # Run the first (non-streaming) hop synchronously HERE so
-                    # API/timeout errors raise BEFORE the UI starts consuming
-                    # the stream — otherwise the outer fallback loop never
-                    # sees the exception. The new `_groq_first_hop_discover`
-                    # only blocks on the LLM call itself, not on tools, so
-                    # the wait is the same as a no-tools chat.
-                    msgs = list(base)
-                    msgs, prose, calls = _groq_first_hop_discover(
-                        model, msgs, timeout
-                    )
-                    if not calls:
-                        # No tools needed — yield the prose as a one-shot
-                        # iterator so the caller still gets the streaming API.
-                        return iter([prose])
-                    # Tools needed — return the parallel-tools-+-stream
-                    # generator. It yields the model's leading prose
-                    # IMMEDIATELY, then fires tools in parallel, then
-                    # streams the synthesis. Errors mid-stream surface via
-                    # display_and_store_response's fallback markdown.
-                    return _groq_stream_with_parallel_tools(
-                        model, msgs, prose, calls, timeout
-                    )
-                return _groq_chat_with_tools(model, list(base), timeout)
-            except Exception as e:
-                attempts.append((model, e))
-                # Print to server log so you can grep the traceback there too.
-                print(
-                    f"[Groq] {model} failed: {type(e).__name__}: {e}", file=sys.stderr
-                )
-                continue
-        return _format_brain_error("Groq", attempts)
+                st.session_state["_last_used_provider"] = provider
+            except Exception:
+                pass
+            return response
+        # Provider exhausted — try the next one in PROVIDER_ORDER.
+        print(
+            f"[brain={brain_type}] provider {provider} exhausted; "
+            f"trying next in failover chain",
+            file=sys.stderr,
+        )
 
-    if brain_type == "Thinker":
-        if gemini_client is None:
-            return "❌ Gemini client not initialized. Set `GOOGLE_API_KEY` in your environment."
-        # Filter out `system_note` rows (inline lore-save confirmations) —
-        # they're UI-only and would just confuse the model if we fed them
-        # back as conversation context.
-        ctx_parts = [
-            f"{'User' if m.get('role') == 'user' else 'Assistant'}: {m.get('content')}"
-            for m in chat_history[-6:]
-            if m.get("role") in ("user", "assistant")
-        ]
-        full_prompt = "\n\n".join(ctx_parts + [f"User: {prompt}"])
-
-        attempts: list[tuple[str, Exception]] = []
-        models = getattr(st.session_state, "gemini_models", DEFAULT_GEMINI_MODELS)
-        for model in models:
-            try:
-                return _gemini_chat_with_tools(
-                    model, system_prompt, full_prompt, temperature, timeout
-                )
-            except Exception as e:
-                attempts.append((model, e))
-                print(
-                    f"[Gemini] {model} failed: {type(e).__name__}: {e}", file=sys.stderr
-                )
-                continue
-        return _format_brain_error("Gemini", attempts)
-
-    return "Invalid brain type selected."
+    # All four providers failed. Surface the combined attempt log.
+    return _format_brain_error(f"{brain_type} (all providers)", all_attempts)
 
 
 # ---------------------------------------------------------------------------
@@ -2188,12 +3116,60 @@ def _sidebar_personality_and_brain() -> tuple[str, str]:
         key="brain_selector",
         label_visibility="collapsed",
     )
-    st.sidebar.caption(
-        "⚡ **Fast:** Instant answers (Groq)"
-        if brain_type == "Fast"
-        else "🕵️ **Thinker:** Deep reasoning (Gemini 2.5 Thinking)"
-    )
+    # Brain Power is now a *preference* — the dispatcher always has access
+    # to all four providers and auto-fails-over across them. Fast just
+    # means "prefer Groq → OpenRouter → Cohere → Gemini"; Thinker flips
+    # the order to prefer Gemini for reasoning.
+    if brain_type == "Fast":
+        st.sidebar.caption(
+            "⚡ **Fast:** prefers ⚡Groq → 🎛️OpenRouter → 🪶Cohere → 🕵️Gemini. "
+            "Best for streaming chat, low latency, snappy first-token."
+        )
+    else:
+        st.sidebar.caption(
+            "🕵️ **Thinker:** prefers 🕵️Gemini → 🪶Cohere → 🎛️OpenRouter → ⚡Groq. "
+            "Best for deeper reasoning, hard questions, longer context."
+        )
+
+    # Show which providers are live this session (one tiny pill per provider).
+    _sidebar_provider_status_pills()
     return personality, brain_type
+
+
+def _sidebar_provider_status_pills() -> None:
+    """Render a compact row of provider status indicators just under the
+    brain selector. Each pill shows the provider emoji + ✅/❌/💤:
+
+      - ✅ initialised + has at least one model selected
+      - ⚠️ initialised but no model selected (won't be tried)
+      - ❌ key missing or init failed
+      - 💤 idle but ready (initialised, never used yet — rare display state)
+
+    This turns "is OpenRouter actually wired up?" from a 3-step guess into
+    a glance.
+    """
+    rows = [
+        ("🪶", "Cohere", cohere_client, "cohere_models", DEFAULT_COHERE_MODELS),
+        ("⚡", "Groq", groq_client, "groq_models", DEFAULT_GROQ_MODELS),
+        ("🕵️", "Gemini", gemini_client, "gemini_models", DEFAULT_GEMINI_MODELS),
+        ("🎛️", "OpenRouter", openrouter_client, "openrouter_models", DEFAULT_OPENROUTER_MODELS),
+    ]
+    last_used = st.session_state.get("_last_used_provider")
+    pills: list[str] = []
+    for emoji, name, client, state_key, defaults in rows:
+        if client is None:
+            pills.append(f"{emoji}❌")
+            continue
+        models = st.session_state.get(state_key) or defaults
+        if not models:
+            pills.append(f"{emoji}⚠️")
+            continue
+        marker = "🟢" if name == last_used else "✅"
+        pills.append(f"{emoji}{marker}")
+    st.sidebar.caption(
+        "Providers: " + "  ".join(pills)
+        + ("  •  last: " + last_used if last_used else "")
+    )
 
 
 def _sidebar_model_settings() -> float:
@@ -2221,145 +3197,186 @@ def _sidebar_model_settings() -> float:
     return temperature
 
 
-def _sidebar_cache_savings() -> None:
-    """Show Groq prompt-cache hit stats so you can verify the cost
-    optimisation is actually working. Stats are populated by
-    `_record_cache_usage` after every Groq completion in this session.
+# Per-provider documented discount on cached input tokens. Used to
+# compute "effective billed tokens" in the sidebar. Cohere v2 doesn't
+# publish a documented cache discount (their pricing model is different),
+# so we just show the raw token count and skip the savings math.
+_CACHE_DISCOUNT = {
+    "Groq": 0.50,       # 50% off cached tokens
+    "OpenRouter": 0.50, # most upstream models use OpenAI-style 50%
+    "Gemini": 0.75,     # implicit caching on Gemini 2.5/3.x via the AI Studio API
+    "Cohere": 0.0,      # no documented automatic cache discount yet
+}
 
-    Why this exists: Groq's prompt caching is automatic but invisible.
-    The only way to know it's hitting is to read `cached_tokens` off the
-    usage block. Surfacing it in the sidebar turns "I think we saved
-    money" into a measurable number you can quote.
+
+def _sidebar_cache_savings() -> None:
+    """Per-provider prompt-cache hit stats. One row per provider that has
+    seen any traffic this session.
+
+    Stats are populated by `_record_cache_usage` (OpenAI-shape) and
+    `_record_cohere_usage` (Cohere v2 shape). Gemini cache telemetry is
+    not yet captured — that's a follow-up.
+
+    Surfaces both per-turn and session-cumulative hit rates so you can
+    watch caching actually working in real time.
     """
-    stats = st.session_state.get("_groq_cache_stats")
-    if not stats or stats.get("total_prompt_tokens", 0) == 0:
+    all_stats = st.session_state.get("_provider_cache_stats", {})
+    # Fall back to the legacy single-provider store if the new one is empty
+    # (covers the upgrade case where existing sessions still have only the
+    # old Groq stats).
+    if not all_stats:
+        legacy = st.session_state.get("_groq_cache_stats")
+        if legacy and legacy.get("total_prompt_tokens", 0):
+            all_stats = {"Groq": legacy}
+    if not all_stats:
         return
 
-    total = stats["total_prompt_tokens"]
-    cached = stats["total_cached_tokens"]
-    last_total = stats["last_prompt_tokens"]
-    last_cached = stats["last_cached_tokens"]
+    # Compute aggregate savings across all providers for the header.
+    agg_total = 0
+    agg_billed = 0.0
+    for provider, stats in all_stats.items():
+        t = stats.get("total_prompt_tokens", 0)
+        c = stats.get("total_cached_tokens", 0)
+        discount = _CACHE_DISCOUNT.get(provider, 0.0)
+        agg_total += t
+        agg_billed += t - discount * c
+    if agg_total == 0:
+        return
+    agg_savings_pct = (agg_total - agg_billed) / agg_total * 100
 
-    hit_rate = (cached / total * 100) if total else 0
-    last_hit_rate = (last_cached / last_total * 100) if last_total else 0
-    # Groq's documented discount is 50% on cached input tokens — so the
-    # effective tokens billed = total - 0.5*cached.
-    effective_billed = total - 0.5 * cached
-    savings_pct = ((total - effective_billed) / total * 100) if total else 0
+    last_provider = st.session_state.get("_last_used_provider", "—")
+    with st.sidebar.expander(
+        f"💰 Cache savings: ~{agg_savings_pct:.0f}% (last: {last_provider})",
+        expanded=False,
+    ):
+        for provider, stats in all_stats.items():
+            total = stats.get("total_prompt_tokens", 0)
+            cached = stats.get("total_cached_tokens", 0)
+            last_total = stats.get("last_prompt_tokens", 0)
+            last_cached = stats.get("last_cached_tokens", 0)
+            if total == 0:
+                continue
 
-    with st.sidebar.expander(f"💰 Cache savings: {savings_pct:.0f}%", expanded=False):
+            discount = _CACHE_DISCOUNT.get(provider, 0.0)
+            hit_rate = (cached / total * 100) if total else 0
+            effective = total - discount * cached
+            savings_pct = ((total - effective) / total * 100) if total else 0
+
+            emoji = PROVIDER_EMOJI.get(provider, "🤖")
+            st.markdown(f"**{emoji} {provider}** — {savings_pct:.0f}% off")
+            st.caption(
+                f"Session: {total:,} input tokens, "
+                f"{cached:,} cached ({hit_rate:.0f}% hit). "
+                f"Last turn: {last_total:,} → {last_cached:,} cached."
+            )
+            if discount > 0:
+                st.caption(
+                    f"Effective billed: ~{effective:,.0f} tokens "
+                    f"(saved ~{total - effective:,.0f} at {discount*100:.0f}% off)."
+                )
+            else:
+                st.caption(
+                    f"({provider} doesn't publish an automatic cache discount; "
+                    "showing raw counts only.)"
+                )
+            # Surface OpenRouter dollar cost — free models report $0.00
+            # so this is a free "warning" when paid models start spending.
+            if provider == "OpenRouter":
+                total_cost = float(stats.get("total_cost_usd", 0.0) or 0.0)
+                last_cost = float(stats.get("last_cost_usd", 0.0) or 0.0)
+                if total_cost > 0 or last_cost > 0:
+                    st.caption(
+                        f"💸 **OpenRouter spend:** "
+                        f"session ${total_cost:.4f} · last turn ${last_cost:.4f}"
+                    )
+                else:
+                    st.caption(
+                        "💸 **OpenRouter spend:** $0.00 "
+                        "(only free models used so far)."
+                    )
         st.caption(
-            f"**Session total:** {total:,} prompt tokens, "
-            f"{cached:,} from cache ({hit_rate:.0f}% hit rate)."
-        )
-        st.caption(
-            f"**Last turn:** {last_total:,} tokens, "
-            f"{last_cached:,} cached ({last_hit_rate:.0f}% hit rate)."
-        )
-        st.caption(
-            f"Effective billed: ~{effective_billed:,.0f} tokens "
-            f"(saved ~{total - effective_billed:,.0f} = {savings_pct:.0f}%)."
-        )
-        st.caption(
-            "Groq applies a 50% discount on cached input tokens automatically. "
-            "Cache expires after ~2 hours of no use."
+            "Most providers cache prefixes automatically. Keep the system "
+            "prompt + tool schemas at the start of the request to maximise hits."
         )
 
 
-def _sidebar_model_chain_picker() -> None:
-    """Picker UI for the per-provider fallback chains.
+def _sidebar_provider_picker(
+    *,
+    provider: str,
+    state_key: str,
+    default_models: list[str],
+    catalogue_fetcher,
+    client: Any,
+    section_label: str,
+    section_help: str = "",
+    extra_warnings: dict[str, str] | None = None,
+) -> None:
+    """Render one provider's model multiselect + custom-add + warnings.
 
-    Uses a `multiselect` (validated against the live catalogue) instead of a
-    free-form text input — typos in the old text box used to 404 every
-    model, which then made the outer fallback loop hit the low-TPM Groq
-    model and report a misleading 'rate_limit' error.
-
-    A small text field below the picker lets power users register a custom
-    model ID that isn't in the live listing (preview releases, private
-    deployments, etc).
+    Shared body so each of the four provider sections looks and behaves
+    identically. The `client` argument is just used to gate the section
+    behind a "client not initialised" notice; the actual API calls live
+    in the dispatcher.
     """
-    st.sidebar.markdown("**Model Fallback Chains**")
-    st.sidebar.caption("Tried in order. Each model is attempted before the next.")
+    st.sidebar.markdown(f"**{section_label}**")
+    if section_help:
+        st.sidebar.caption(section_help)
 
-    # ----- Groq -----
-    groq_catalogue = fetch_groq_catalogue()
-    # Merge in any custom IDs the user added in a previous rerun so they
-    # remain selectable.
-    custom_groq = st.session_state.get("_custom_groq_models", [])
-    groq_options = list(dict.fromkeys(list(groq_catalogue) + list(custom_groq)))
+    if client is None:
+        st.sidebar.caption(f"⚠️ {provider} client not initialised — set the API key.")
+        # Still allow editing the chain (it'll be used when the key arrives).
 
-    current = st.session_state.get("groq_models") or list(DEFAULT_GROQ_MODELS)
-    current = [m for m in current if m in groq_options]
+    catalogue = catalogue_fetcher()
+    custom_bucket_key = f"_custom_{provider.lower()}_models"
+    custom = st.session_state.get(custom_bucket_key, [])
+    options = list(dict.fromkeys(list(catalogue) + list(custom)))
+
+    current = st.session_state.get(state_key) or list(default_models)
+    current = [m for m in current if m in options]
     if not current:
-        current = [m for m in DEFAULT_GROQ_MODELS if m in groq_options]
+        current = [m for m in default_models if m in options]
 
-    chosen_groq = st.sidebar.multiselect(
-        "Groq models (Fast brain)",
-        options=groq_options,
+    chosen = st.sidebar.multiselect(
+        f"{provider} models",
+        options=options,
         default=current,
-        key="groq_models_picker",
-        help="Drag the chips left-to-right to reorder. The first one is tried first.",
+        key=f"{state_key}_picker",
+        help="Tried top-to-bottom. First success returns; failures fall through.",
     )
-    if chosen_groq:
-        st.session_state.groq_models = chosen_groq
+    if chosen:
+        st.session_state[state_key] = chosen
     else:
-        st.sidebar.caption("⚠️ No Groq model selected — falling back to defaults.")
-        st.session_state.groq_models = list(DEFAULT_GROQ_MODELS)
+        st.sidebar.caption(f"⚠️ No {provider} model selected — falling back to defaults.")
+        st.session_state[state_key] = list(default_models)
 
-    # Surface a warning if the user keeps a known low-TPM model in their chain.
-    low_tpm_selected = [
-        m for m in st.session_state.groq_models if m in LOW_TPM_GROQ_MODELS
-    ]
-    if low_tpm_selected:
-        for m in low_tpm_selected:
-            st.sidebar.warning(f"`{m}`: {LOW_TPM_GROQ_MODELS[m]}")
+    # Per-model warnings (e.g. Groq's low-TPM model).
+    if extra_warnings:
+        for m in st.session_state[state_key]:
+            if m in extra_warnings:
+                st.sidebar.warning(f"`{m}`: {extra_warnings[m]}")
 
-    # ----- Gemini -----
-    gemini_catalogue = fetch_gemini_catalogue()
-    custom_gemini = st.session_state.get("_custom_gemini_models", [])
-    gemini_options = list(dict.fromkeys(list(gemini_catalogue) + list(custom_gemini)))
-
-    current_gem = st.session_state.get("gemini_models") or list(DEFAULT_GEMINI_MODELS)
-    current_gem = [m for m in current_gem if m in gemini_options]
-    if not current_gem:
-        current_gem = [m for m in DEFAULT_GEMINI_MODELS if m in gemini_options]
-
-    chosen_gem = st.sidebar.multiselect(
-        "Gemini models (Thinker brain)",
-        options=gemini_options,
-        default=current_gem,
-        key="gemini_models_picker",
-    )
-    if chosen_gem:
-        st.session_state.gemini_models = chosen_gem
-    else:
-        st.sidebar.caption("⚠️ No Gemini model selected — falling back to defaults.")
-        st.session_state.gemini_models = list(DEFAULT_GEMINI_MODELS)
-
-    # ----- Custom model escape hatch -----
-    with st.sidebar.expander("➕ Add a custom model ID", expanded=False):
+    # Custom model ID add field.
+    with st.sidebar.expander(f"➕ Add custom {provider} model", expanded=False):
         st.caption(
-            "For preview releases or private deployments not in the live catalogue."
-        )
-        provider = st.radio(
-            "Provider", ("Groq", "Gemini"), horizontal=True, key="_custom_provider"
+            f"For preview / private / paid models not in the live "
+            f"{provider} catalogue."
         )
         custom_id = st.text_input(
             "Model ID",
-            key="_custom_model_input",
-            placeholder="e.g. gemini-4-flash-preview",
+            key=f"{state_key}_custom_input",
+            placeholder={
+                "Cohere": "e.g. command-r-08-2024",
+                "Groq": "e.g. llama-4-instruct",
+                "Gemini": "e.g. gemini-4-flash-preview",
+                "OpenRouter": "e.g. anthropic/claude-sonnet-4.5",
+            }.get(provider, "model-id"),
         )
-        if st.button("Add", key="_custom_model_add"):
+        if st.button("Add", key=f"{state_key}_add_button"):
             mid = (custom_id or "").strip()
             if not mid:
                 st.warning("Empty model ID ignored.")
             else:
-                bucket_key = (
-                    "_custom_groq_models"
-                    if provider == "Groq"
-                    else "_custom_gemini_models"
-                )
-                bucket = st.session_state.setdefault(bucket_key, [])
+                bucket = st.session_state.setdefault(custom_bucket_key, [])
                 if mid in bucket:
                     st.info(f"`{mid}` already in custom list.")
                 else:
@@ -2369,10 +3386,69 @@ def _sidebar_model_chain_picker() -> None:
                     )
                     st.rerun()
 
-    # ----- Refresh button -----
-    if st.sidebar.button("🔄 Refresh model catalogue"):
+
+def _sidebar_model_chain_picker() -> None:
+    """Picker UI for ALL four provider fallback chains.
+
+    Section order: Cohere → Groq → Gemini → OpenRouter (as requested).
+    Each section is independent — selecting fewer models in one provider
+    doesn't affect the others. The dispatcher walks PROVIDER_ORDER for
+    auto-failover when models within a provider all fail.
+    """
+    st.sidebar.markdown("**Model Fallback Chains**")
+    st.sidebar.caption(
+        "Each provider has its own chain. The dispatcher tries the brain's "
+        "preferred provider first, then auto-fails-over to the next provider "
+        "if all of its models fail."
+    )
+
+    _sidebar_provider_picker(
+        provider="Cohere",
+        state_key="cohere_models",
+        default_models=DEFAULT_COHERE_MODELS,
+        catalogue_fetcher=fetch_cohere_catalogue,
+        client=cohere_client,
+        section_label="🪶 Cohere",
+        section_help="Command family. Strong tool use, structured streaming.",
+    )
+
+    _sidebar_provider_picker(
+        provider="Groq",
+        state_key="groq_models",
+        default_models=DEFAULT_GROQ_MODELS,
+        catalogue_fetcher=fetch_groq_catalogue,
+        client=groq_client,
+        section_label="⚡ Groq",
+        section_help="Fastest streaming. Llama / GPT-OSS / Mixtral families.",
+        extra_warnings=LOW_TPM_GROQ_MODELS,
+    )
+
+    _sidebar_provider_picker(
+        provider="Gemini",
+        state_key="gemini_models",
+        default_models=DEFAULT_GEMINI_MODELS,
+        catalogue_fetcher=fetch_gemini_catalogue,
+        client=gemini_client,
+        section_label="🕵️ Gemini",
+        section_help="Best at deep reasoning. Non-streaming today.",
+    )
+
+    _sidebar_provider_picker(
+        provider="OpenRouter",
+        state_key="openrouter_models",
+        default_models=DEFAULT_OPENROUTER_MODELS,
+        catalogue_fetcher=fetch_openrouter_catalogue,
+        client=openrouter_client,
+        section_label="🎛️ OpenRouter",
+        section_help="300+ models behind one key. Free tier shown by default; "
+                     "add paid models via the expander below.",
+    )
+
+    if st.sidebar.button("🔄 Refresh model catalogues"):
         fetch_groq_catalogue.clear()
         fetch_gemini_catalogue.clear()
+        fetch_cohere_catalogue.clear()
+        fetch_openrouter_catalogue.clear()
         st.rerun()
 
 
@@ -2794,6 +3870,9 @@ def main() -> None:
         # Pick the whimsical "thinking" caption now so it stays consistent
         # for the lifetime of this turn (don't reroll each rerun).
         generating_phrase = pick_generating_phrase(personality)
+        # Track wall time for the turn so we can show "via Cohere · 1.2s"
+        # in the attribution caption below the response.
+        turn_started_at = time.time()
         # Use a built-in spinner only for the network round-trip itself —
         # the in-bubble animated indicator handles the streaming phase.
         with st.spinner(f"🌀 {generating_phrase}"):
@@ -2805,7 +3884,11 @@ def main() -> None:
                 temperature_val,
                 stream=use_stream,
             )
-        display_and_store_response(response, generating_phrase=generating_phrase)
+        display_and_store_response(
+            response,
+            generating_phrase=generating_phrase,
+            turn_started_at=turn_started_at,
+        )
         # Render any lore-save confirmations the tool layer queued during
         # this turn. They show up inline in the chat as compact captions —
         # NOT as popups or toasts — and are persisted into the transcript.
