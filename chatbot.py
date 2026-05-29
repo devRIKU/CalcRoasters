@@ -2906,45 +2906,25 @@ def get_ai_response_with_brain(
             base.append({"role": m["role"], "content": m.get("content", "")})
     base.append({"role": "user", "content": prompt})
 
-    # Manual override: if the user picked a specific provider+model in the
-    # sidebar, use ONLY that — skip the failover entirely. This is the
-    # escape hatch for "I want this exact model, period."
-    manual = st.session_state.get("_manual_model") or {}
-    manual_provider = manual.get("provider")
-    manual_model = manual.get("model")
-    if manual_provider and manual_model:
-        # Temporarily override the provider's model list with just the one
-        # the user picked. Restore on exit so the chain isn't permanently
-        # mutated.
-        state_key_map = {
-            "Cohere":     "cohere_models",
-            "Groq":       "groq_models",
-            "Gemini":     "gemini_models",
-            "OpenRouter": "openrouter_models",
-        }
-        state_key = state_key_map.get(manual_provider)
-        prev_models = st.session_state.get(state_key) if state_key else None
-        if state_key:
-            st.session_state[state_key] = [manual_model]
-        try:
-            response, attempts = _try_provider(
-                manual_provider, base, prompt, chat_history,
-                system_prompt, temperature, timeout, stream=stream,
-            )
-            if response is not None:
-                try:
-                    st.session_state["_last_used_provider"] = manual_provider
-                except Exception:
-                    pass
-                return response
-            # Manual model failed — surface that explicitly. Don't silently
-            # failover; the user picked this on purpose.
-            return _format_brain_error(
-                f"Manual override ({manual_provider}/{manual_model})", attempts,
-            )
-        finally:
-            if state_key and prev_models is not None:
-                st.session_state[state_key] = prev_models
+    # Manual override: if the user pinned a specific provider in the
+    # sidebar, use ONLY that provider (still walking its own model chain)
+    # and skip cross-provider failover. Errors surface explicitly because
+    # the user picked this on purpose.
+    manual_provider = st.session_state.get("_manual_provider")
+    if manual_provider:
+        response, attempts = _try_provider(
+            manual_provider, base, prompt, chat_history,
+            system_prompt, temperature, timeout, stream=stream,
+        )
+        if response is not None:
+            try:
+                st.session_state["_last_used_provider"] = manual_provider
+            except Exception:
+                pass
+            return response
+        return _format_brain_error(
+            f"Pinned provider ({manual_provider})", attempts,
+        )
 
     order = _provider_order_for_brain(brain_type)
     all_attempts: list[tuple[str, Exception]] = []
@@ -3401,66 +3381,37 @@ def _sidebar_provider_picker(
                     st.rerun()
 
 
-def _sidebar_manual_model_override() -> None:
-    """Optional manual selector — pin one specific model from any provider.
+def _sidebar_manual_provider_override() -> None:
+    """Optional provider pin — force a specific provider for all turns.
 
-    When set, the dispatcher uses ONLY this model and skips both the
-    per-provider chain AND the cross-provider failover. Failure surfaces
-    explicitly (no silent fallback) because the user picked this on
-    purpose. Set to "(auto)" to clear and resume normal failover.
+    When pinned, the dispatcher uses ONLY this provider (walking its own
+    model fallback chain as configured below) and skips cross-provider
+    failover. Set to "(auto)" to resume normal multi-provider failover.
     """
-    st.sidebar.markdown("**Manual model override**")
+    st.sidebar.markdown("**Provider**")
+    options = ["(auto)", "🪶 Cohere", "⚡ Groq", "🕵️ Gemini", "🎛️ OpenRouter"]
+    label_to_provider = {
+        "(auto)":         None,
+        "🪶 Cohere":     "Cohere",
+        "⚡ Groq":        "Groq",
+        "🕵️ Gemini":    "Gemini",
+        "🎛️ OpenRouter": "OpenRouter",
+    }
+    # Reverse map for restoring the current pick on rerun.
+    provider_to_label = {v: k for k, v in label_to_provider.items()}
 
-    # Build the full list of provider/model pairs from each catalogue +
-    # any custom additions the user made.
-    options: list[str] = ["(auto — use failover chain)"]
-    provider_specs = [
-        ("🪶 Cohere",     "Cohere",     fetch_cohere_catalogue,     "_custom_cohere_models",     DEFAULT_COHERE_MODELS,     cohere_client),
-        ("⚡ Groq",        "Groq",       fetch_groq_catalogue,       "_custom_groq_models",       DEFAULT_GROQ_MODELS,       groq_client),
-        ("🕵️ Gemini",     "Gemini",     fetch_gemini_catalogue,     "_custom_gemini_models",     DEFAULT_GEMINI_MODELS,     gemini_client),
-        ("🎛️ OpenRouter", "OpenRouter", fetch_openrouter_catalogue, "_custom_openrouter_models", DEFAULT_OPENROUTER_MODELS, openrouter_client),
-    ]
-    # Map from display label -> (provider_name, model_id).
-    label_lookup: dict[str, tuple[str, str]] = {}
-    for emoji_label, prov, fetcher, custom_key, defaults, client in provider_specs:
-        if client is None:
-            continue
-        catalogue = fetcher()
-        custom = st.session_state.get(custom_key, [])
-        merged = list(dict.fromkeys(list(catalogue) + list(custom)))
-        for m in merged:
-            display = f"{emoji_label}  ·  {m}"
-            options.append(display)
-            label_lookup[display] = (prov, m)
-
-    # Restore previous manual pick (display label) so the selector reflects state.
-    current_manual = st.session_state.get("_manual_model") or {}
-    current_label = "(auto — use failover chain)"
-    if current_manual.get("provider") and current_manual.get("model"):
-        target = (current_manual["provider"], current_manual["model"])
-        for lbl, pair in label_lookup.items():
-            if pair == target:
-                current_label = lbl
-                break
-
+    current_provider = st.session_state.get("_manual_provider")
+    current_label = provider_to_label.get(current_provider, "(auto)")
     default_idx = options.index(current_label) if current_label in options else 0
+
     picked = st.sidebar.selectbox(
-        "Pin a specific model",
+        "Pin a provider",
         options=options,
         index=default_idx,
-        key="_manual_model_selector",
+        key="_manual_provider_selector",
         label_visibility="collapsed",
-        help=(
-            "When pinned, the dispatcher uses ONLY this model and skips "
-            "auto-failover. Errors surface immediately. Set to '(auto)' to "
-            "resume normal multi-provider failover."
-        ),
     )
-    if picked == "(auto — use failover chain)":
-        st.session_state["_manual_model"] = None
-    else:
-        prov, mid = label_lookup[picked]
-        st.session_state["_manual_model"] = {"provider": prov, "model": mid}
+    st.session_state["_manual_provider"] = label_to_provider.get(picked)
 
 
 def _sidebar_model_chain_picker() -> None:
@@ -3471,7 +3422,7 @@ def _sidebar_model_chain_picker() -> None:
     the others.
     """
     # Manual override sits at the top — it's the most opinionated choice.
-    _sidebar_manual_model_override()
+    _sidebar_manual_provider_override()
 
     st.sidebar.markdown("**Fallback chains**")
 
