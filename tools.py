@@ -377,12 +377,37 @@ def _dispatch_inner(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
         if name == "recall_lore":
             user_name = (args.get("user_name") or "").strip()
+            # Try RAG-filtered recall based on last user query for efficiency
+            try:
+                last_query = ""
+                msgs = st.session_state.get("messages", [])
+                for m in reversed(msgs):
+                    if m.get("role") == "user":
+                        last_query = m.get("content", "")[:300]
+                        break
+                if last_query:
+                    relevant = lore_store.search_facts(user_name, last_query, top_k=8)
+                    # Still get full counts for metadata
+                    public_all = lore_store.list_public_facts(user_name)
+                    private_all = lore_store.list_private_facts(user_name)
+                    return {
+                        "ok": True,
+                        "user_name": user_name,
+                        "facts": relevant,  # RAG filtered
+                        "public_facts": public_all,
+                        "private_facts": private_all,
+                        "filtered": True,
+                        "query": last_query[:100],
+                    }
+            except Exception:
+                pass
+            # Fallback: full facts
             public = lore_store.list_public_facts(user_name)
             private = lore_store.list_private_facts(user_name)
             return {
                 "ok": True,
                 "user_name": user_name,
-                "facts": public + private,       # combined for convenience
+                "facts": public + private,
                 "public_facts": public,
                 "private_facts": private,
             }
