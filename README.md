@@ -22,15 +22,24 @@ text-to-speech with no keys required.
     streaming, low-latency replies, snappy first-token.
   - **🕵️ Thinker:** prefers `Gemini → Cohere → OpenRouter → Groq`. Best for
     deeper reasoning, harder questions, longer context.
-- **Provider attribution on every turn.** Each assistant message gets a
-  small footer caption: `via 🪶 Cohere · 1.2s`. You always know who actually
-  served the response, even after a failover.
+- **Provider attribution on every turn.** Each assistant message records
+  the provider that actually served it (`provider`, `elapsed_s`) — even
+  after a failover — and the sidebar's status pills / cache widget surface
+  it (`last: 🪶 Cohere`). The inline footer caption was dropped for a
+  cleaner chat, the provenance is still there.
 - **Cache savings + spend telemetry in the sidebar.** The `💰 Cache savings`
   expander shows per-provider hit rates, effective billed tokens, and (for
   OpenRouter) running dollar cost — so you can verify caching is actually
   hitting and catch surprise spend immediately.
 - **7 personality modes** — Roaster, Smart, Debater, Strategic, Tech Nerd,
   Chill Squad, Exhausted Student. Each remaps the UI theme in real time.
+- **Two gender variants + a live transition button.** The persona ships as a
+  **♂️ male** and a **♀️ female** system prompt (`System_prompt.md` /
+  `System_prompt_female.md`). The sidebar's `🔁 Transition` button
+  gender-swaps the *active* conversation **without clearing anything** — the
+  app fires a system event telling the LLM it was swapped mid-chat, so
+  memories, lore and the whole transcript carry over. A toggle directly
+  below it decides the gender a *new* conversation starts in.
 - **Per-user lore memory** — public facts in `lore.json`; private facts in
   **Firebase Firestore** (if configured) with **SQLite** (`private_lore.db`)
   as a zero-config local fallback. The model is taught when to use each via
@@ -148,6 +157,7 @@ The sidebar groups settings into seven sections:
 | Section | What it controls |
 |---|---|
 | **Identity** | Your display name + expandable view of what Sanniva remembers about you (split into 🌐 Public lore and 🔒 Private lore). |
+| **Gender / Persona Identity** | `🔁 Transition to ♂️/♀️` button (mid-chat gender swap that keeps context) + `♀️ Start new chats as the correct gender` toggle directly below it. |
 | **Personality** | Pick one of seven modes; the UI re-themes itself instantly. |
 | **Brain Power** | `Fast` or `Thinker` — quality dial, not a provider lock. Below the selector you'll see a live row of provider status pills. |
 | **Model settings** | Clear chat, creativity slider, per-model timeout. |
@@ -160,30 +170,91 @@ short "🔧 Running …" caption appears above the input while the tool
 executes in parallel; the model's leading prose ("on it — let me check…")
 streams into the chat *immediately* so the UI never sits frozen.
 
+### Gender variants & the transition event
+
+The persona exists in two full system prompts:
+
+| Variant | File | Pronouns |
+|---|---|---|
+| ♂️ Male | `System_prompt.md` | he/him |
+| ♀️ Female (the real Sanniva) | `System_prompt_female.md` | she/her |
+
+Two sidebar controls manage which one is active:
+
+- **`🔁 Transition to …`** — swaps the active variant *mid-conversation*.
+  `st.session_state.messages` (the context), lore, tools and every other bit
+  of session state are left untouched. What the button actually does:
+  1. sets `gender_mode` to the other variant,
+  2. appends a `system_note` event bubble to the transcript
+     (`🔁 Transition event — … Context preserved …`),
+  3. appends a record to `_gender_events`, which
+     `build_system_prompt()` renders as a
+     `## ⚡ LIVE SYSTEM EVENT — GENDER TRANSITION` block **on every
+     subsequent turn** (it sits in the prompt's variable tail, so prompt
+     caching is unaffected),
+  4. sends one extra in-band `[[SYSTEM EVENT — GENDER TRANSITION]]` message
+     on the very next request.
+
+  The LLM is explicitly told: nothing else changed, do not re-introduce
+  yourself, do not recap, keep going in the same turn, and only mention the
+  swap if the user brings it up.
+- **`♀️ Start new chats as the correct gender (female)`** — the toggle
+  *below* the transition button. It only affects conversations that haven't
+  started yet (or after `🗑️ Clear Chat`); flipping it mid-chat is a no-op and
+  the sidebar says so, because switching a running conversation is what the
+  Transition button is for.
+
+Both variants are keyed into the same prompt-caching layout: static content
+first, the transition block last, so a swap costs one cache miss, not one
+per turn.
+
 ### Default model fallback chains
 
-**🪶 Cohere** (newest first)
-1. `command-a-plus-05-2026` — newest Command-A Plus, top capability
-2. `command-r-plus-08-2024` — older but reliable, strong tool use
+*Verified 2026-09-28 directly against each provider's own model docs /
+catalogue (see the links in each block).*
 
-**⚡ Groq**
-1. `llama-3.3-70b-versatile` — 300K TPM free tier, tool-calling
-2. `openai/gpt-oss-120b` — 250K TPM, tool-calling
+**🪶 Cohere** — [docs.cohere.com/docs/models](https://docs.cohere.com/docs/models)
+1. `command-a-plus-05-2026` — MoE flagship: vision + agentic + reasoning
+2. `command-a-03-2025` — 256K context, excellent tool use / RAG, high throughput
+3. `command-r-plus-08-2024` — long-lived reliable fallback
 
-> `llama-3.1-8b-instant` is **not** in the default chain — its 6 000 TPM
-> cap is too low for the ~10 KB system prompt and was the source of
-> misleading rate-limit errors. It's still available via the picker.
+> The old `command-r-plus` / `command-r` / `command-light` aliases were
+> deprecated 2025-09-15. The dated `command-r-plus-08-2024` build is still
+> live and stays as the third string.
 
-**🕵️ Gemini**
-1. `gemini-3.5-flash` — newest GA flash, strongest reasoning
-2. `gemini-3-flash-preview` — preview build of the 3.x flash line
-3. `gemini-3.1-flash-lite` — cheapest, fastest fallback
+**⚡ Groq** — [console.groq.com/docs/models](https://console.groq.com/docs/models)
+1. `openai/gpt-oss-120b` — featured production model, 250K TPM, tool-calling
+2. `openai/gpt-oss-20b` — production, ~1 000 TPS, cheap, tool-calling
+3. `qwen/qwen3.8-27b` — preview MoE, thinking + instruct modes, tool-calling
+
+> `llama-3.1-8b-instant` **and** `llama-3.3-70b-versatile` were shut down on
+> **2026-08-16** for free/developer tiers; `groq/compound*` went on
+> 2026-09-21 and `qwen/qwen3.6-27b` was replaced by `qwen/qwen3.8-27b` on
+> 2026-09-14. All four still appear in the picker's warning list, so a stale
+> custom ID explains itself instead of 404ing silently.
+
+**🕵️ Gemini** — [ai.google.dev/gemini-api/docs/models](https://ai.google.dev/gemini-api/docs/models)
+1. `gemini-3.8-flash` — newest stable Flash, strongest reasoning (free tier ✅)
+2. `gemini-3.7-flash` — previous stable Flash (free tier ✅)
+3. `gemini-3.5-flash-lite` — cheapest / fastest free-tier fallback (free tier ✅)
+
+> Every model in this chain has a "Free of charge" Developer-API free tier
+> ([pricing](https://ai.google.dev/gemini-api/docs/pricing)); Batch/Flex
+> variants do **not**.
 
 **🎛️ OpenRouter** (free-tier only by default — add paid via sidebar)
-1. `x-ai/grok-4-fast:free`
-2. `openai/gpt-oss-120b:free`
-3. `deepseek/deepseek-chat-v3.1:free`
-4. `meta-llama/llama-3.3-70b-instruct:free`
+1. `z-ai/glm-4.5-air:free` — fast agent-centric MoE, hybrid thinking mode, 131K
+2. `openai/gpt-oss-120b:free` — reliable general reasoning + tool calling, 131K
+3. `nvidia/nemotron-3-ultra-550b-a55b:free` — 1M-token flagship MoE, tool calling
+4. `meta-llama/llama-3.3-70b-instruct:free` — long-lived stable multilingual fallback
+
+> All four were checked free & live on OpenRouter's own model pages /
+> `/api/v1/models` catalogue. Free endpoints are rate-limited (20 req/min,
+> 50 req/day, or 1 000 req/day after a one-time $10 credit top-up).
+
+The catalogue fetcher now accepts any model whose **output** is text
+(`…->text`), so text-out multimodal models like `qwen/qwen3.8-27b:free` and
+`google/gemma-4-31b-it:free` show up in the picker too.
 
 All four lists are editable in the sidebar at runtime — useful when a
 model ID 404s or you want to try something new.
@@ -202,10 +273,10 @@ streaming error), the dispatcher does this:
 Example — `Fast` brain with all providers wired up, Groq down:
 
 ```
-Groq/llama-3.3-70b-versatile  → rate-limited
-Groq/openai/gpt-oss-120b      → timeout
+Groq/openai/gpt-oss-120b            → rate-limited
+Groq/openai/gpt-oss-20b             → timeout
    [Groq exhausted, falling over to OpenRouter]
-OpenRouter/x-ai/grok-4-fast:free → ✅ served the response
+OpenRouter/z-ai/glm-4.5-air:free    → ✅ served the response
 ```
 
 The user sees their answer; the sidebar's provider attribution caption
@@ -222,7 +293,8 @@ shows `via 🎛️ OpenRouter · 1.4s`. No banner, no error, no "try again".
 | `tools.py` | Tool schemas (OpenAI / Gemini shapes), `dispatch()` / `dispatch_json()` / `dispatch_parallel()` runners. |
 | `lore_store.py` | Per-user memory: `lore.json` (public) + Firestore or SQLite (private). |
 | `styles.py` | Writes `.streamlit/config.toml` colour theme per personality. |
-| `System_prompt.md` | The persona spec injected as the system message. Includes privacy gate, Friend Mode, family, interests, online presence. |
+| `System_prompt.md` | The persona spec injected as the system message — **♂️ male variant** (he/him). Includes privacy gate, Friend Mode, family, interests, online presence. |
+| `System_prompt_female.md` | **♀️ female variant** of the same persona (she/her) — the "correct gender" a new chat starts in by default. Same section structure, so the persona-mode trimming and the gender-transition event block work identically. |
 | `test_tts.py` | Standalone smoke test for the free TTS engines. |
 | `sanniva_face.jpg` | Avatar shown in chat. |
 | `requirements.txt` | Pinned dependencies (Streamlit, groq, google-genai, cohere, openai, etc.). |
@@ -299,25 +371,42 @@ no successful response. Check:
    each provider and confirm the model IDs look current.
 3. Network — `curl https://api.groq.com/openai/v1/models` etc.
 
-### "rate_limit" / "Limit 6000" from Groq
-The free tier on `llama-3.1-8b-instant` is 6 000 TPM. The default chain
-doesn't include it, but if you added it back via the picker, the system
-prompt alone may exceed the cap. Remove it from the chain or wait 60 s.
+### "rate_limit" / TPM errors from Groq
+Groq's default chain (`openai/gpt-oss-120b` → `openai/gpt-oss-20b` →
+`qwen/qwen3.8-27b`) sits at 250K TPM. If you added a small/legacy model via
+the picker, the ~17 kB system prompt can blow its per-minute cap — remove it
+or wait 60 s. Decommissioned models (both Llama IDs, `groq/compound*`,
+`qwen/qwen3.6-27b`) return 404, not 429, and the sidebar lists them as
+warnings if you paste one in.
 
 ### OpenRouter cost suddenly > $0.00
 You added a paid model via the sidebar's "Add custom OpenRouter model"
 expander. Check the `💰 Cache savings` expander's "OpenRouter spend"
 line for the running session total.
 
-### Gemini returns 404 on `gemini-3-flash-preview`
-The preview tier may not be enabled on your Google project. The fallback
-loop will skip it and try `gemini-3.1-flash-lite` automatically — no
-action needed.
+### Gemini returns 404 on a preview model
+The preview tier may not be enabled on your Google project. The default
+chain is stable-only (`gemini-3.8-flash` → `gemini-3.7-flash` →
+`gemini-3.5-flash-lite`), so the fallback loop skips a 404 and moves on —
+no action needed.
 
 ### Cohere "no model selected"
-The picker defaults to `command-a-plus-05-2026, command-r-plus-08-2024`.
-If you deselected both, the dispatcher will skip Cohere entirely on
-failover. Re-add at least one model in the picker.
+The picker defaults to `command-a-plus-05-2026, command-a-03-2025,
+command-r-plus-08-2024`. If you deselected all of them, the dispatcher
+skips Cohere entirely on failover. Re-add at least one model in the picker.
+
+### OpenRouter free models suddenly 429
+Free endpoints are rate-limited per model (20 req/min, 50 req/day; 1 000
+req/day after a one-time $10 credit top-up). Keep 3–4 free models in the
+chain — the fallback walks to the next one when one is throttled.
+
+### Gender transition button did nothing
+It only fires when the target variant differs from the active one (the
+button label always shows the *other* gender, so pressing it twice returns
+you to where you started). Before the first message there is no context to
+preserve, so the button just switches the starting variant without logging
+an event. Check the `Active: ♀️/♂️` caption above it and the `↺` note under
+the toggle.
 
 ### TTS produces a blank audio file
 Make sure `edge-tts` is installed (`pip install edge-tts`) and that you

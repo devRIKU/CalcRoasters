@@ -9,11 +9,13 @@ copy .env.example .env
 ```
 
 2) Open `.env` and fill in your API keys:
-- `GOOGLE_API_KEY`
+- `GOOGLE_API_KEY` (Gemini)
 - `GROQ_API_KEY`
-- `SARVAM_API_KEY` (optional)
-- `FISH_AUDIO_API_KEY` (optional)
-- `SILICON_FLOW_API_KEY` (optional)
+- `COHERE_API_KEY`
+- `OPENROUTER_API_KEY`
+- `SARVAM_API_KEY` (optional, paid TTS)
+- `FISH_AUDIO_API_KEY` (optional, paid TTS)
+- `SILICON_FLOW_API_KEY` (optional, paid TTS)
 
 3) Activate your virtual environment (Windows PowerShell):
 
