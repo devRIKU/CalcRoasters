@@ -77,44 +77,63 @@ SILICON_FLOW_API_KEY = os.environ.get("SILICON_FLOW_API_KEY")
 OPENROUTER_REFERER = os.environ.get("OPENROUTER_REFERER", "https://ai-sanniva.streamlit.app")
 OPENROUTER_TITLE = os.environ.get("OPENROUTER_TITLE", "Sanniva Digital Twin")
 
-# Current Groq production models (verified May 2026).
-# mixtral-8x7b-32768 was deprecated 2025-03-20; mixtral-7b never existed.
+# Current Groq production models (verified 2026-09-28 against
+# console.groq.com/docs/models and …/docs/deprecations).
+#
+# `llama-3.1-8b-instant` and `llama-3.3-70b-versatile` were SHUT DOWN on
+# 2026-08-16 for free/developer tiers — Groq's recommended replacements are
+# `openai/gpt-oss-20b` and `openai/gpt-oss-120b` / `qwen/qwen3.8-27b`.
+# `groq/compound` + `groq/compound-mini` were decommissioned 2026-09-21 and
+# `qwen/qwen3.6-27b` was replaced by `qwen/qwen3.8-27b` on 2026-09-14.
 # Inline-pseudo-tool parser in _extract_inline_tool_calls() recovers from
 # models (like gpt-oss-*) that emit <function=...>{...}</function> as text.
-#
-# llama-3.1-8b-instant has a low free-tier TPM cap (6000 tok/min) which the
-# ~17kB system prompt blows through immediately. We keep it in the catalogue
-# (LOW_TPM_GROQ_MODELS) but NOT in the default fallback chain — it was the
-# source of "rate-limit" errors that confused the model-changer UI.
 DEFAULT_GROQ_MODELS = [
-    "llama-3.3-70b-versatile",  # 300K TPM free tier, supports tool calling
-    "openai/gpt-oss-120b",  # 250K TPM, also supports tool calling
+    "openai/gpt-oss-120b",  # featured production model, 250K TPM, tool calling
+    "openai/gpt-oss-20b",   # production model, 1K TPS, cheap + tool calling
+    "qwen/qwen3.8-27b",     # preview MoE successor to qwen3.6-27b, tool calling
 ]
+# Models that are dead or heavily rate-limited. Kept as sidebar warnings so a
+# user who pasted an old ID in "Add custom model" gets told why it 404s.
 LOW_TPM_GROQ_MODELS = {
-    "llama-3.1-8b-instant": "6,000 TPM — the system prompt alone may exceed the per-minute cap.",
+    "llama-3.1-8b-instant": "Decommissioned 2026-08-16 — use `openai/gpt-oss-20b`.",
+    "llama-3.3-70b-versatile": "Decommissioned 2026-08-16 — use `openai/gpt-oss-120b` or `qwen/qwen3.8-27b`.",
+    "qwen/qwen3.6-27b": "Replaced 2026-09-14 by `qwen/qwen3.8-27b`.",
+    "groq/compound": "Decommissioned 2026-09-21.",
+    "groq/compound-mini": "Decommissioned 2026-09-21.",
 }
-# Gemini IDs as of May 2026. Order = preference: newest GA first, preview
-# second (may 404 if the project lacks preview access — we just skip it),
-# then the cheap/fast lite as a final fallback.
+# Gemini IDs (verified 2026-09-28 against ai.google.dev/gemini-api/docs/models
+# and …/pricing). Order = preference: newest stable Flash first, previous
+# stable Flash second, then the cheapest free-tier Lite as final fallback.
+# Every model below has a "Free of charge" free tier on the Developer API.
 DEFAULT_GEMINI_MODELS = [
-    "gemini-3.5-flash",  # newest GA flash, strongest reasoning here
-    "gemini-3-flash-preview",  # preview build of the 3.x flash line
-    "gemini-3.1-flash-lite",  # cheapest, fastest fallback in the 3.x family
+    "gemini-3.8-flash",       # newest GA flash (free tier), strongest reasoning
+    "gemini-3.7-flash",       # previous GA flash (free tier), fast + reliable
+    "gemini-3.5-flash-lite",  # cheapest/fastest free-tier fallback
 ]
-# Cohere Command family — newest first. command-a-plus is the top-tier
-# (most capable, slightly slower); command-r-plus is the fallback (fast,
-# strong on tool-use). Both support v2 streaming + function calling.
+# Cohere Command family — newest first (verified 2026-09-28 against
+# docs.cohere.com/docs/models). command-a-plus is the MoE flagship (vision +
+# agentic + reasoning); command-a is the high-throughput 256K workhorse;
+# command-r-plus is the long-lived fallback. All support v2 streaming +
+# function calling. Legacy `command-r-plus`/`command-r`/`command-light`
+# aliases were deprecated 2025-09-15.
 DEFAULT_COHERE_MODELS = [
-    "command-a-plus-05-2026",   # newest Command-A Plus, top capability
-    "command-r-plus-08-2024",   # older but reliable, strong tool use
+    "command-a-plus-05-2026",     # newest Command-A Plus, top capability
+    "command-a-03-2025",          # 256K context, excellent tool use / RAG
+    "command-r-plus-08-2024",     # older but reliable, strong tool use
 ]
 # OpenRouter: free-tier-only by default to avoid surprise bills. The user
 # can add paid models via the sidebar's "Add custom model" expander; cost
 # telemetry will surface in the cache-savings widget so they see spend.
+# Verified free & live 2026-09-28 (mix of the free-models API listing and the
+# individual model pages):
+#   - z-ai/glm-4.5-air:free            fast MoE, hybrid thinking mode, 131K
+#   - openai/gpt-oss-120b:free         reliable tool calling, 131K
+#   - nvidia/nemotron-3-ultra-…:free   1M context, NVIDIA's flagship MoE
+#   - meta-llama/llama-3.3-70b…:free   long-lived stable multilingual fallback
 DEFAULT_OPENROUTER_MODELS = [
-    "x-ai/grok-4-fast:free",
+    "z-ai/glm-4.5-air:free",
     "openai/gpt-oss-120b:free",
-    "deepseek/deepseek-chat-v3.1:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
     "meta-llama/llama-3.3-70b-instruct:free",
 ]
 # Provider ordering for auto-failover. If all models in the current
@@ -124,6 +143,31 @@ DEFAULT_OPENROUTER_MODELS = [
 # first within each "brain power" tier.
 PROVIDER_ORDER = ["Cohere", "Groq", "Gemini", "OpenRouter"]
 AVATAR_PATH = "sanniva_face.jpg"
+
+# ---------------------------------------------------------------------------
+# Gender / persona variants
+# ---------------------------------------------------------------------------
+# The persona ships in two gender variants, each a full system-prompt file:
+#   male   -> System_prompt.md
+#   female -> System_prompt_female.md
+#
+# `gender_mode` (session state) is the ACTIVE variant for the current
+# conversation. Two controls manage it:
+#   1. 🔁 Transition button  — swaps variant MID-conversation. It does NOT
+#      clear anything: the transcript, lore and session state stay exactly
+#      as they were, and the LLM is told about the swap as an explicit
+#      system event (see `_render_gender_event_block`).
+#   2. ♀️ Start-gender toggle — which variant a NEW conversation begins in.
+GENDER_MALE = "male"
+GENDER_FEMALE = "female"
+GENDER_PROMPT_FILES = {
+    GENDER_MALE: "System_prompt.md",
+    GENDER_FEMALE: "System_prompt_female.md",
+}
+GENDER_LABELS = {GENDER_MALE: "♂️ Male", GENDER_FEMALE: "♀️ Female"}
+GENDER_PRONOUNS = {GENDER_MALE: "he/him", GENDER_FEMALE: "she/her"}
+# Sanniva is a girl — so the female variant is the "correct" starting gender.
+DEFAULT_GENDER = GENDER_FEMALE
 
 
 def _make_clients() -> tuple[Any, Any, Any, Any, list[str]]:
@@ -246,7 +290,7 @@ def fetch_gemini_catalogue() -> list[str]:
         ids: list[str] = []
         for m in gemini_client.models.list():
             mid = getattr(m, "name", "") or ""
-            # `models/gemini-3.5-flash` → `gemini-3.5-flash`
+            # `models/gemini-3.8-flash` → `gemini-3.8-flash`
             if mid.startswith("models/"):
                 mid = mid[len("models/") :]
             if not mid:
@@ -334,9 +378,12 @@ def fetch_openrouter_catalogue() -> list[str]:
             if not mid:
                 continue
             modality = (m.get("architecture") or {}).get("modality", "")
-            # We only want text→text chat models. Skip vision-only, audio,
-            # embedding, etc.
-            if modality and "text->text" not in modality:
+            # We want chat models — anything whose OUTPUT is text. Models
+            # like `qwen/qwen3.8-27b` and `google/gemma-4-31b-it` advertise
+            # `text+image+video->text`, which is a perfectly good chat model
+            # in this app (we just never send images). Skip audio-out /
+            # embedding / image-out modalities.
+            if modality and not modality.endswith("->text"):
                 continue
             # Free models are identifiable by `:free` suffix OR zero
             # prompt+completion pricing.
@@ -661,8 +708,9 @@ def get_catchy_phrase() -> str:
                 },
             ],
             # Smallest, fastest production model. Was the deprecated
-            # mixtral-8x7b-32768 (shutdown 2025-03-20).
-            model="llama-3.1-8b-instant",
+            # mixtral-8x7b-32768 (shutdown 2025-03-20) and then
+            # llama-3.1-8b-instant (shutdown 2026-08-16).
+            model="openai/gpt-oss-20b",
         )
         return (response.choices[0].message.content or fallback).strip()
     except Exception:
@@ -1048,6 +1096,17 @@ _DEFAULT_STATE = {
     # banner. The queue itself is lazily created by tools.push_tool_status
     # because queue.Queue isn't JSON-serialisable; this just primes the log.
     "_tool_status_log": [],
+    # --- Gender / persona variant -------------------------------------
+    # Active variant for THIS conversation (swapped by the Transition
+    # button, seeded from the sidebar toggle for new chats).
+    "gender_mode": DEFAULT_GENDER,
+    # Every transition event fired this session, oldest first. Replayed
+    # into the system prompt (and once, in-band) so the LLM never "forgets"
+    # that it was swapped mid-conversation.
+    "_gender_events": [],
+    # One-shot flag: send an extra in-band system-event message on the next
+    # request, then clear it.
+    "_gender_transition_pending": False,
 }
 
 
@@ -1057,11 +1116,22 @@ def initialize_session_state() -> None:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _load_raw_system_prompt() -> str:
-    """Load the FULL system prompt file once and cache. Reads from disk only
-    on cache miss; subsequent reads are in-memory. The cache key is empty
-    so the file is read once per process lifetime (TTL 1h)."""
-    for path in ("System_prompt.md", "System_prompt.txt"):
+def _load_raw_system_prompt(gender: str = GENDER_MALE) -> str:
+    """Load one gender variant of the FULL system prompt file, cached.
+
+    Reads from disk only on cache miss (one read per variant per process,
+    TTL 1h). Fallback chain so a missing/unreadable file never breaks the
+    app: requested variant -> other variant -> legacy `System_prompt.txt`
+    -> one-line stub.
+    """
+    other = GENDER_FEMALE if gender == GENDER_MALE else GENDER_MALE
+    filenames: list[str] = []
+    for g in (gender, other):
+        fname = GENDER_PROMPT_FILES.get(g)
+        if fname and fname not in filenames:
+            filenames.append(fname)
+    filenames.append("System_prompt.txt")
+    for path in filenames:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return f.read()
@@ -1088,9 +1158,9 @@ _PERSONA_SUBSECTION_HEADERS = {
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_system_prompt(active_persona: str = "") -> str:
-    """Load the base system prompt with only the ACTIVE persona-mode
-    subsection retained inside `## 1. Persona Modes`.
+def load_system_prompt(active_persona: str = "", gender: str = GENDER_MALE) -> str:
+    """Load the base system prompt (for the active gender variant) with only
+    the ACTIVE persona-mode subsection retained inside `## 1. Persona Modes`.
 
     The full file (`System_prompt.md`) is ~47 KB / ~11,600 tokens and grew
     organically. Most of its weight is content the model needs once (the
@@ -1103,10 +1173,14 @@ def load_system_prompt(active_persona: str = "") -> str:
     and returns the trimmed prompt. Caching is keyed by `active_persona`
     so each mode is built once per session.
 
+    `gender` selects which variant file is read (`System_prompt.md` for
+    male, `System_prompt_female.md` for female); the persona-mode trimming
+    below is identical for both because the two files share a structure.
+
     Falls back gracefully: if the active persona isn't found or the §1
     boundaries can't be located, returns the unmodified file.
     """
-    raw = _load_raw_system_prompt()
+    raw = _load_raw_system_prompt(gender)
     if not active_persona or active_persona not in _PERSONA_SUBSECTION_HEADERS:
         return raw
 
@@ -1145,6 +1219,117 @@ def load_system_prompt(active_persona: str = "") -> str:
     )
 
     return raw[: section_match.start()] + trimmed_section + raw[section_match.end() :]
+
+
+def _gender_from_toggle() -> str:
+    """Gender a NEW conversation should start in, per the sidebar toggle."""
+    return GENDER_FEMALE if st.session_state.get("start_as_female", True) else GENDER_MALE
+
+
+def _gender_label(gender: str | None) -> str:
+    return GENDER_LABELS.get(gender or "", gender or "?")
+
+
+def _perform_gender_transition(target: str, *, reason: str = "transition button") -> bool:
+    """Swap the active persona gender WITHOUT touching the conversation.
+
+    The whole point of the transition button: the transcript (context),
+    lore, tools and every other bit of session state stay byte-for-byte
+    identical — only the persona variant changes, and the LLM is told about
+    the swap as an explicit event on the next turn (`_gender_events` is
+    replayed into the system prompt, plus one in-band system-event message).
+
+    Returns True when the gender actually changed.
+    """
+    target = target if target in GENDER_PROMPT_FILES else GENDER_FEMALE
+    current = st.session_state.get("gender_mode") or _gender_from_toggle()
+    if target == current:
+        st.session_state["gender_mode"] = current
+        return False
+
+    st.session_state["gender_mode"] = target
+    messages = st.session_state.setdefault("messages", [])
+    event = {
+        "from": current,
+        "to": target,
+        "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "message_index": len(messages),
+        "reason": reason,
+    }
+    events = list(st.session_state.get("_gender_events") or [])
+    events.append(event)
+    st.session_state["_gender_events"] = events[-4:]
+
+    # Only log a visible chat event once a conversation actually exists —
+    # before the first turn there is no context to preserve.
+    if messages:
+        note = (
+            f"🔁 **Transition event** — {GENDER_LABELS[target]} "
+            f"({GENDER_PRONOUNS.get(target, 'they/them')}) is active now. "
+            "Context preserved: memories, lore, personality mode and the "
+            "full chat history are unchanged."
+        )
+        messages.append({"role": "system_note", "content": note})
+        st.session_state["_gender_transition_pending"] = True
+    return True
+
+
+def _render_gender_event_block(events: list[dict], gender: str) -> str:
+    """System-prompt block describing past gender-transition events.
+
+    Appended at the very END of the prompt (the per-turn-variable zone) so
+    it never invalidates the cacheable prefix. Rewritten every turn from
+    session state, which is what lets the LLM keep the swap in context for
+    the rest of the conversation.
+    """
+    lines = [
+        "\n\n## ⚡ LIVE SYSTEM EVENT — GENDER TRANSITION (injected by the app)",
+        "The user pressed the app's transition control mid-conversation. "
+        "The events below are ground truth about who you are right now:",
+    ]
+    for ev in events[-3:]:
+        lines.append(
+            f"- [{ev.get('at', '?')}] Gender swapped "
+            f"{_gender_label(ev.get('from'))} → {_gender_label(ev.get('to'))} "
+            f"at message #{ev.get('message_index', '?')}."
+        )
+    lines.append(
+        "How to handle this event:\n"
+        "- NOTHING else changed. Same memories, lore, chat history, "
+        "friendships, interests, personality mode and opinions — the context "
+        "is intact and must not be reset.\n"
+        "- Do NOT re-introduce yourself, do NOT re-ask anything already "
+        "answered, do NOT recap the conversation.\n"
+        "- Keep replying in the SAME conversation, in the SAME turn, as the "
+        f"active variant: {_gender_label(gender)} "
+        f"({GENDER_PRONOUNS.get(gender, 'they/them')}) per the active system "
+        "prompt.\n"
+        "- Only acknowledge the swap if the user brings it up; a one-line "
+        "joke about it is fine if it fits the active persona mode."
+    )
+    return "\n".join(lines)
+
+
+def _gender_event_message() -> str:
+    """One-shot, in-band system-event message handed to the LLM as a turn.
+
+    Belt and braces on top of `_render_gender_event_block`: providers that
+    weight the most recent user turn heavily (and any path that trims the
+    system prompt) still see an unambiguous swap notice.
+    """
+    events = st.session_state.get("_gender_events") or []
+    ev = events[-1] if events else {}
+    target = st.session_state.get("gender_mode", DEFAULT_GENDER)
+    return (
+        "[[SYSTEM EVENT — GENDER TRANSITION]] The app just swapped your "
+        f"gender: {_gender_label(ev.get('from'))} → {_gender_label(target)} "
+        f"({GENDER_PRONOUNS.get(target, 'they/them')}). This is NOT a new "
+        "conversation — every memory, lore fact, the personality mode and the "
+        "entire chat history are unchanged. Do not reset, do not re-introduce "
+        "yourself, do not recap. Continue exactly where the conversation was, "
+        "just as the new-gender persona. Only acknowledge the swap if the user "
+        "mentions it."
+    )
 
 
 PERSONALITY_SUFFIX = {
@@ -1208,6 +1393,30 @@ PERSONALITY_GREETING = {
     "Chill Squad": "hey! *waves* it's Sanniva. just chilling. how's life been with the squad?",
     "Exhausted Student": "*sighs deeply* …hi. it's Sanniva. i swear if this is more homework i'm going to lose it.",
 }
+
+# Female-variant greetings (used when the female system prompt is active).
+PERSONALITY_GREETING_FEMALE = {
+    "Roaster": "oh look, another human. i'm Sanniva. try not to bore me.",
+    "Smart": "Greetings. I am Sanniva. How may I assist you with your intellectual endeavors today?",
+    "Debater": "I'm Sanniva. I'm ready to challenge your views. Bring it on.",
+    "Strategic": "Sanniva online. Systems operational. Ready to optimize your workflow.",
+    "Tech Nerd": "yo. *closes 14 chrome tabs* — Sanniva here. just got my launcher looking insane. what's up?",
+    "Chill Squad": "hey! *waves* it's Sanniva. just chilling. how's life been with the squad?",
+    "Exhausted Student": "*sighs* …hi, it's Sanniva. if this is more homework i'm going to lose it.",
+}
+
+
+def get_greeting(personality: str, gender: str = GENDER_MALE) -> str:
+    """Pick the opening line for the active personality + gender variant."""
+    table = (
+        PERSONALITY_GREETING_FEMALE
+        if gender == GENDER_FEMALE
+        else PERSONALITY_GREETING
+    )
+    return table.get(personality) or PERSONALITY_GREETING.get(
+        personality, "Hello! I'm Sanniva."
+    )
+
 
 # Whimsical "thinking…" phrases shown while the LLM is generating. One list
 # per personality mode so the spinner caption matches Sanniva's current
@@ -1487,7 +1696,12 @@ def build_temporal_context(today: date | None = None) -> str:
 
 
 def build_system_prompt(
-    base: str, personality: str, brain_type: str, user_name: str = ""
+    base: str,
+    personality: str,
+    brain_type: str,
+    user_name: str = "",
+    gender: str = GENDER_MALE,
+    gender_events: list[dict] | None = None,
 ) -> str:
     """Assemble the per-turn system prompt.
 
@@ -1562,6 +1776,12 @@ def build_system_prompt(
     # the entire prompt. Moving it to the end keeps ~95% of the prompt
     # cacheable across the day boundary.
     prompt += build_temporal_context()
+
+    # Gender-transition events also live in the variable tail: they only
+    # exist after the Transition button is pressed, and rewriting them here
+    # (instead of mutating chat history) keeps the context intact.
+    if gender_events:
+        prompt += _render_gender_event_block(list(gender_events), gender)
     return prompt
 
 
@@ -2029,8 +2249,8 @@ def _format_brain_error(brain: str, attempts: list[tuple[str, Exception]]) -> st
         hints.append(
             "**Groq tokens-per-minute cap.** The system prompt is ~17kB. Either:\n"
             "  - Wait 60s and try again, or\n"
-            "  - Drop `llama-3.1-8b-instant` from the chain (it's a 6K-TPM model), or\n"
-            "  - Use `llama-3.3-70b-versatile` (300K TPM), or\n"
+            "  - Drop the low-TPM model from the chain, or\n"
+            "  - Use `openai/gpt-oss-120b` (250K TPM) / `openai/gpt-oss-20b`, or\n"
             "  - Upgrade at https://console.groq.com/settings/billing"
         )
     if "timeout" in err_str.lower() or "TimeoutError" in type(last_err).__name__:
@@ -2901,6 +3121,11 @@ def get_ai_response_with_brain(
     # OpenAI-shape base message list (used by Groq, OpenRouter, Cohere).
     # Gemini's branch ignores this and builds its own from chat_history.
     base = [{"role": "system", "content": system_prompt}]
+    # One-shot in-band reminder for a gender transition that just fired.
+    # Cleared by main() only after the turn succeeds, so a failed request
+    # doesn't silently swallow the event.
+    if st.session_state.get("_gender_transition_pending"):
+        base.append({"role": "user", "content": _gender_event_message()})
     for m in chat_history[-6:]:
         if m.get("role") in ("user", "assistant"):
             base.append({"role": m["role"], "content": m.get("content", "")})
@@ -3175,11 +3400,65 @@ def _sidebar_provider_status_pills() -> None:
     st.sidebar.caption("  ".join(pills))
 
 
+def _sidebar_gender() -> None:
+    """Gender controls: Transition button (top) + start-gender toggle below.
+
+    Order and semantics are deliberate:
+      1. **🔁 Transition** — swaps the active persona variant mid-chat. The
+         conversation is NOT cleared: the app appends a transition event
+         that the LLM is explicitly told about, so context carries over.
+      2. **♀️ Start toggle** — which variant a NEW conversation begins in.
+         Changing it mid-conversation does not touch the running chat
+         (that's what the Transition button is for).
+    """
+    st.sidebar.markdown("**Gender / Persona Identity**")
+    active = st.session_state.get("gender_mode") or _gender_from_toggle()
+    other = GENDER_MALE if active == GENDER_FEMALE else GENDER_FEMALE
+
+    st.sidebar.caption(
+        f"Active: {_gender_label(active)} · {GENDER_PRONOUNS.get(active, '')}"
+    )
+
+    if st.sidebar.button(
+        f"🔁 Transition to {_gender_label(other)}",
+        key="_gender_transition_button",
+        help="Gender-swap the active persona mid-conversation. Nothing is "
+        "cleared — a transition event is sent to the LLM so it keeps the "
+        "same memories, lore and chat context.",
+    ):
+        _perform_gender_transition(other, reason="sidebar transition button")
+        st.rerun()
+
+    # The toggle sits directly BELOW the transition button.
+    st.session_state["start_as_female"] = st.sidebar.toggle(
+        "♀️ Start new chats as the correct gender (female)",
+        value=st.session_state.get("start_as_female", True),
+        key="_start_as_female_toggle",
+        help="New conversations begin with the female system prompt "
+        "(`System_prompt_female.md`). Use the Transition button above to "
+        "swap gender in the middle of an existing conversation.",
+    )
+
+    if not st.session_state.get("messages"):
+        # No conversation yet — the toggle simply defines the starting gender.
+        st.session_state["gender_mode"] = _gender_from_toggle()
+    elif _gender_from_toggle() != st.session_state.get("gender_mode"):
+        st.sidebar.caption(
+            "↺ Toggle applies to new chats — use **Transition** to switch "
+            "this conversation."
+        )
+
+
 def _sidebar_model_settings() -> float:
     if st.sidebar.button("🗑️ Clear Chat"):
         st.session_state.messages = []
         st.session_state.last_spoken_idx = -1
         st.session_state.greeting_shown = False
+        # A cleared chat is a NEW conversation: reset the persona variant to
+        # whatever the start-gender toggle says, and forget old events.
+        st.session_state.gender_mode = _gender_from_toggle()
+        st.session_state["_gender_events"] = []
+        st.session_state["_gender_transition_pending"] = False
         st.rerun()
 
     temperature = st.sidebar.slider("Creativity Level (Chaos)", 0.0, 1.0, 0.7, 0.1)
@@ -3360,9 +3639,9 @@ def _sidebar_provider_picker(
             "Model ID",
             key=f"{state_key}_custom_input",
             placeholder={
-                "Cohere":     "command-r-08-2024",
-                "Groq":       "llama-4-instruct",
-                "Gemini":     "gemini-4-flash-preview",
+                "Cohere":     "command-a-03-2025",
+                "Groq":       "qwen/qwen3.8-27b",
+                "Gemini":     "gemini-3.8-flash",
                 "OpenRouter": "anthropic/claude-sonnet-4.5",
             }.get(provider, "model-id"),
             label_visibility="collapsed",
@@ -3828,10 +4107,10 @@ def _show_os_greeting() -> None:
             pass
 
 
-def _show_initial_greeting(personality: str) -> None:
+def _show_initial_greeting(personality: str, gender: str = GENDER_MALE) -> None:
     if st.session_state.greeting_shown:
         return
-    greeting = PERSONALITY_GREETING.get(personality, "Hello! I'm Sanniva.")
+    greeting = get_greeting(personality, gender)
     with st.chat_message("assistant", avatar=get_avatar()):
         stream_data_to_chat(greeting)
     st.session_state.messages.append({"role": "assistant", "content": greeting})
@@ -3855,6 +4134,7 @@ def main() -> None:
 
     # --- Sidebar ---
     _sidebar_identity()
+    _sidebar_gender()
     _maybe_show_name_popup()
     personality, brain_type = _sidebar_personality_and_brain()
     temperature_val = _sidebar_model_settings()
@@ -3866,7 +4146,8 @@ def main() -> None:
     # dispatch starts, even if the LLM stream is still going. Lives in its
     # own fragment so it can update without redrawing the chat history.
     _render_tool_status_banner()
-    _show_initial_greeting(personality)
+    active_gender = st.session_state.get("gender_mode") or _gender_from_toggle()
+    _show_initial_greeting(personality, active_gender)
 
     if prompt := st.chat_input(get_catchy_phrase()):
         st.session_state.audio_bytes = None
@@ -3874,14 +4155,21 @@ def main() -> None:
         with st.chat_message("user"):
             st.markdown(prompt)
 
+        active_gender = (
+            st.session_state.get("gender_mode") or _gender_from_toggle()
+        )
         system_prompt = build_system_prompt(
             # Pass the active persona so load_system_prompt strips the 6
             # inactive mode subsections at the source (~1,300-token saving
             # per request). Cached per-persona, so each mode is built once.
-            load_system_prompt(personality),
+            # `active_gender` selects the male/female variant file.
+            load_system_prompt(personality, active_gender),
             personality,
             brain_type,
             user_name=st.session_state.get("user_name", ""),
+            gender=active_gender,
+            # Replayed every turn so a mid-chat gender swap stays in context.
+            gender_events=st.session_state.get("_gender_events"),
         )
 
         # Fast brain streams; Thinker brain still returns a finished string.
@@ -3908,6 +4196,8 @@ def main() -> None:
             generating_phrase=generating_phrase,
             turn_started_at=turn_started_at,
         )
+        # The one-shot transition reminder was delivered with this turn.
+        st.session_state["_gender_transition_pending"] = False
         # Render any lore-save confirmations the tool layer queued during
         # this turn. They show up inline in the chat as compact captions —
         # NOT as popups or toasts — and are persisted into the transcript.
