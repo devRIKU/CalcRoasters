@@ -775,6 +775,28 @@ def display_chat_history() -> None:
 # popup so a fact-save click or a name submit doesn't trigger a full chat
 # rerender (which on slow networks was visibly redrawing every prior
 # message). Falls back to a no-op decorator on Streamlit < 1.33.
+#
+# ⚠️ FRAGMENT POLICY — read before decorating anything else:
+# A fragment may only create widgets INSIDE its own container. Streamlit
+# enforces this at runtime with
+# `StreamlitFragmentWidgetsNotAllowedOutsideError: Fragments cannot write
+# widgets to outside containers.` (streamlit/elements/lib/policies.py,
+# check_fragment_path_policy).
+#
+# In practice this means:
+#   ✅ a fragment may render into the MAIN body (st.button, st.form, …)
+#   ❌ a fragment may NEVER own `st.sidebar.*` widgets — the sidebar is a
+#      different root container, so its delta path (e.g. [1, x, y]) is not
+#      prefixed by the fragment's path (e.g. [0, k]) and the check raises.
+#      This holds for the first *and* every later rerun of the app, so the
+#      failure happens on plain page load, not just on interaction.
+#   ❌ a fragment may never write into a container created outside it either
+#      (e.g. `container = st.container()` then `with container:` inside the
+#      fragment).
+# Non-widget elements (st.caption / st.markdown / st.chat_message) are not
+# policed, which is why the status banner and lore drainer are safe here.
+# Anything that touches the sidebar must stay in the main script —
+# see tests/test_fragment_policy.py for the static guard on this rule.
 _fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
 if _fragment is None:
     def _fragment(fn=None, **_kw):
@@ -3489,8 +3511,20 @@ def _sidebar_gender() -> None:
         )
 
 
-@_fragment
 def _sidebar_model_settings() -> float:
+    """Render the model/temperature controls in the sidebar.
+
+    NOTE: this function is deliberately NOT wrapped in `@st.fragment`, even
+    though a fragment would keep slider drags from redrawing the transcript.
+    Fragments cannot create widgets outside their own container, and every
+    widget here lives in `st.sidebar` — decorating this function made the
+    fragment path check raise
+    `StreamlitFragmentWidgetsNotAllowedOutsideError` on the "🗑️ Clear Chat"
+    button (the first widget in the block), which aborted the whole script
+    run before the chat UI ever rendered. Sidebar widgets must be rendered
+    by the main script; `st.rerun()` below therefore performs a normal full
+    rerun, which is the correct scope for wiping the conversation anyway.
+    """
     if st.sidebar.button("🗑️ Clear Chat"):
         st.session_state.messages = []
         st.session_state.last_spoken_idx = -1
@@ -3734,13 +3768,22 @@ def _sidebar_manual_provider_override() -> None:
     st.session_state["_manual_provider"] = label_to_provider.get(picked)
 
 
-@_fragment
 def _sidebar_model_chain_picker() -> None:
     """Picker UI for ALL four provider fallback chains.
 
     Section order: Cohere → Groq → Gemini → OpenRouter. Each section is
     independent — selecting fewer models in one provider doesn't affect
     the others.
+
+    NOTE: deliberately NOT `@st.fragment` (it used to be, which crashed the
+    app). Every widget in here — the manual-override selectbox, the four
+    `st.sidebar.multiselect`s, the sidebar "Add custom model" button and the
+    "🔄 Refresh catalogues" button — is created inside the sidebar's root
+    container, i.e. outside any fragment container. The fragment path check
+    rejects that with `StreamlitFragmentWidgetsNotAllowedOutsideError`, so
+    the whole settings block died on page load. Keeping this in the main
+    script restores the normal behaviour: sidebar interactions trigger a
+    full rerun.
     """
     # Manual override sits at the top — it's the most opinionated choice.
     _sidebar_manual_provider_override()
