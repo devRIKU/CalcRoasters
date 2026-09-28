@@ -31,9 +31,18 @@ from typing import Any
 
 LORE_FILE = os.path.join(os.path.dirname(__file__), "lore.json")
 DB_FILE = os.path.join(os.path.dirname(__file__), "private_lore.db")
-_lock = threading.Lock()
+_lock = threading.RLock()  # RLock allows nested acquisition
 _cache: dict[str, Any] | None = None
 _cache_mtime: float | None = None
+
+# In-memory cache for private facts: user_key -> (timestamp, facts)
+_private_cache: dict[str, tuple[float, list[str]]] = {}
+_private_cache_ttl = 30.0  # seconds
+_private_cache_lock = threading.Lock()
+
+# Persistent SQLite connection for speed (WAL mode)
+_sqlite_conn: sqlite3.Connection | None = None
+_sqlite_conn_lock = threading.Lock()
 
 _use_firebase = False
 _firestore_db = None
@@ -76,10 +85,16 @@ def _init_firebase() -> None:
             sys.stderr.write(f"Firebase initialization failed: {e}. Using SQLite fallback.\n")
 
 
-def _init_db() -> None:
-    with _lock:
-        with sqlite3.connect(DB_FILE) as conn:
-            conn.execute("""
+def _get_sqlite_conn() -> sqlite3.Connection:
+    """Get persistent SQLite connection with WAL mode for speed."""
+    global _sqlite_conn
+    with _sqlite_conn_lock:
+        if _sqlite_conn is None:
+            _sqlite_conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=10.0)
+            _sqlite_conn.execute("PRAGMA journal_mode=WAL;")
+            _sqlite_conn.execute("PRAGMA synchronous=NORMAL;")
+            _sqlite_conn.execute("PRAGMA cache_size=-64000;")  # 64MB cache
+            _sqlite_conn.execute("""
                 CREATE TABLE IF NOT EXISTS private_facts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_key TEXT,
@@ -87,7 +102,12 @@ def _init_db() -> None:
                     ts INTEGER
                 );
             """)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_user_key ON private_facts(user_key);")
+            _sqlite_conn.execute("CREATE INDEX IF NOT EXISTS idx_user_key ON private_facts(user_key);")
+            _sqlite_conn.commit()
+        return _sqlite_conn
+
+def _init_db() -> None:
+    _get_sqlite_conn()
 
 
 # Initialize datastores
@@ -185,10 +205,7 @@ def _add_public_fact(name: str, fact_clean: str, now: int) -> bool:
 
 
 def _add_private_fact(name: str, fact_clean: str, now: int) -> tuple[bool, str]:
-    """Save a fact to the private store (Firestore preferred, SQLite fallback).
-
-    Returns (was_new, backend) where backend is 'firestore' or 'sqlite'.
-    """
+    """Save a fact to the private store (Firestore preferred, SQLite fallback)."""
     k = _key(name)
     if _use_firebase and _firestore_db is not None:
         try:
@@ -201,23 +218,42 @@ def _add_private_fact(name: str, fact_clean: str, now: int) -> tuple[bool, str]:
                 "fact": fact_clean,
                 "ts": now,
             })
+            _invalidate_private_cache(k)
             return True, "firestore"
         except Exception as e:
             import sys
             sys.stderr.write(f"Firestore add_fact failed: {e}. Falling back to SQLite.\n")
 
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.execute(
-            "SELECT 1 FROM private_facts WHERE user_key = ? AND LOWER(TRIM(fact)) = LOWER(TRIM(?)) LIMIT 1",
-            (k, fact_clean),
-        )
-        if cursor.fetchone():
-            return False, "sqlite"
-        conn.execute(
-            "INSERT INTO private_facts (user_key, fact, ts) VALUES (?, ?, ?)",
-            (k, fact_clean, now),
-        )
-    return True, "sqlite"
+    try:
+        conn = _get_sqlite_conn()
+        with _sqlite_conn_lock:
+            cursor = conn.execute(
+                "SELECT 1 FROM private_facts WHERE user_key = ? AND LOWER(TRIM(fact)) = LOWER(TRIM(?)) LIMIT 1",
+                (k, fact_clean),
+            )
+            if cursor.fetchone():
+                return False, "sqlite"
+            conn.execute(
+                "INSERT INTO private_facts (user_key, fact, ts) VALUES (?, ?, ?)",
+                (k, fact_clean, now),
+            )
+            conn.commit()
+        _invalidate_private_cache(k)
+        return True, "sqlite"
+    except Exception:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.execute(
+                "SELECT 1 FROM private_facts WHERE user_key = ? AND LOWER(TRIM(fact)) = LOWER(TRIM(?)) LIMIT 1",
+                (k, fact_clean),
+            )
+            if cursor.fetchone():
+                return False, "sqlite"
+            conn.execute(
+                "INSERT INTO private_facts (user_key, fact, ts) VALUES (?, ?, ?)",
+                (k, fact_clean, now),
+            )
+        _invalidate_private_cache(k)
+        return True, "sqlite"
 
 
 def add_fact(name: str, fact: str, *, private: bool = False) -> dict[str, Any]:
@@ -271,9 +307,42 @@ def list_public_facts(name: str) -> list[str]:
     return [f.get("text", "") for f in reversed(facts) if f.get("text")]
 
 
-def list_private_facts(name: str) -> list[str]:
-    """Return list of private fact strings from the database (Firestore or SQLite fallback) for a user (most recent first)."""
+def _is_private_cache_valid(k: str) -> bool:
+    with _private_cache_lock:
+        entry = _private_cache.get(k)
+        if not entry:
+            return False
+        ts, _ = entry
+        return (time.time() - ts) < _private_cache_ttl
+
+def _get_private_cache(k: str) -> list[str] | None:
+    with _private_cache_lock:
+        entry = _private_cache.get(k)
+        if entry and (time.time() - entry[0]) < _private_cache_ttl:
+            return entry[1]
+    return None
+
+def _set_private_cache(k: str, facts: list[str]) -> None:
+    with _private_cache_lock:
+        _private_cache[k] = (time.time(), facts)
+
+def _invalidate_private_cache(k: str | None = None) -> None:
+    with _private_cache_lock:
+        if k is None:
+            _private_cache.clear()
+        else:
+            _private_cache.pop(k, None)
+
+def list_private_facts(name: str, use_cache: bool = True) -> list[str]:
+    """Return list of private fact strings (most recent first). Cached 30s."""
     k = _key(name)
+    if not k:
+        return []
+
+    if use_cache:
+        cached = _get_private_cache(k)
+        if cached is not None:
+            return cached
 
     if _use_firebase and _firestore_db is not None:
         try:
@@ -283,18 +352,34 @@ def list_private_facts(name: str) -> list[str]:
                 d = doc.to_dict()
                 facts_list.append((d.get("fact", ""), d.get("ts", 0)))
             facts_list.sort(key=lambda x: x[1], reverse=True)
-            return [f[0] for f in facts_list if f[0]]
+            result = [f[0] for f in facts_list if f[0]]
+            _set_private_cache(k, result)
+            return result
         except Exception as e:
             import sys
             sys.stderr.write(f"Firestore list_private_facts failed: {e}. Falling back to SQLite.\n")
 
-    # SQLite Fallback
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.execute(
-            "SELECT fact FROM private_facts WHERE user_key = ? ORDER BY id DESC",
-            (k,)
-        )
-        return [row[0] for row in cursor.fetchall()]
+    # SQLite with persistent connection
+    try:
+        conn = _get_sqlite_conn()
+        with _sqlite_conn_lock:
+            cursor = conn.execute(
+                "SELECT fact FROM private_facts WHERE user_key = ? ORDER BY id DESC",
+                (k,)
+            )
+            result = [row[0] for row in cursor.fetchall()]
+        _set_private_cache(k, result)
+        return result
+    except Exception:
+        # Fallback to new connection if persistent fails
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.execute(
+                "SELECT fact FROM private_facts WHERE user_key = ? ORDER BY id DESC",
+                (k,)
+            )
+            result = [row[0] for row in cursor.fetchall()]
+        _set_private_cache(k, result)
+        return result
 
 
 def list_facts(name: str) -> list[str]:
@@ -359,11 +444,64 @@ def all_users() -> list[str]:
         return [u.get("name", k) for k, u in db["users"].items()]
 
 
+def get_all_facts(name: str) -> list[str]:
+    """Return combined public + private facts (most recent first, public first)."""
+    if not name:
+        return []
+    public = list_public_facts(name)
+    private = list_private_facts(name)
+    return public + private
+
+def _simple_tokenize(text: str) -> set[str]:
+    import re
+    stop = {"the","a","an","and","or","is","are","was","i","you","me","my","we","us","to","of","in","on","for","with","about","this","that","it","its","be","been","have","has","had","do","does","did","will","would","could","should","can","may","might","must","am","im","dont","cant","wont","just","like","very","so","up","down","out","over","under","again","further","then","once","here","there","all","any","both","each","few","more","most","other","some","such","no","nor","not","only","own","same","than","too","very"}
+    tokens = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return {t for t in tokens if t not in stop and len(t) > 2}
+
+def search_facts(name: str, query: str, top_k: int = 8) -> list[str]:
+    """
+    RAG search over user's facts: score each fact against query, return top_k.
+    Falls back to most recent if query unrelated.
+    """
+    all_facts = get_all_facts(name)
+    if not all_facts:
+        return []
+    if not query or len(query.strip()) < 3:
+        return all_facts[:top_k]
+
+    try:
+        # Use rag_engine if available for better scoring
+        import rag_engine
+        return rag_engine.retrieve_relevant_lore_facts(all_facts, query, top_k=top_k)
+    except Exception:
+        # Fallback simple scoring
+        import math
+        q_tokens = _simple_tokenize(query)
+        if not q_tokens:
+            return all_facts[:top_k]
+        scored = []
+        for fact in all_facts:
+            f_tokens = _simple_tokenize(fact)
+            if not f_tokens:
+                continue
+            inter = len(q_tokens & f_tokens)
+            if inter == 0:
+                # check substring bonus
+                q_lower = query.lower()
+                f_lower = fact.lower()
+                if any(qt in f_lower for qt in q_tokens):
+                    inter = 0.5
+            score = inter / math.sqrt(len(q_tokens) * len(f_tokens)) if inter else 0
+            scored.append((score, fact))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top_score = scored[0][0] if scored else 0
+        if top_score < 0.08:
+            return all_facts[:3]
+        return [f for s, f in scored if s > 0.05][:top_k]
+
 def render_lore_block(name: str, max_facts: int = 20) -> str:
-    """Build a markdown snippet containing both public and private facts to inject into a system prompt."""
-    public_facts = list_public_facts(name)
-    private_facts = list_private_facts(name)
-    all_facts = public_facts + private_facts
+    """Legacy: Build a markdown snippet containing both public and private facts."""
+    all_facts = get_all_facts(name)
     if not all_facts:
         return ""
 
@@ -375,4 +513,25 @@ def render_lore_block(name: str, max_facts: int = 20) -> str:
     lines = [f"## Known facts about {display_name} (from past chats)"]
     for f in all_facts[:max_facts]:
         lines.append(f"- {f}")
+    return "\n".join(lines)
+
+def render_lore_block_rag(name: str, query: str, max_facts: int = 6) -> str:
+    """RAG-optimized: only relevant facts for query."""
+    if not name:
+        return ""
+    relevant = search_facts(name, query, top_k=max_facts)
+    if not relevant:
+        return ""
+
+    display_name = name.strip()
+    rec = get_user(name)
+    if rec:
+        display_name = rec.get("name", display_name)
+
+    all_facts = get_all_facts(name)
+    lines = [f"## Known facts about {display_name} (RAG filtered for this query)"]
+    for f in relevant:
+        lines.append(f"- {f}")
+    if len(relevant) < len(all_facts):
+        lines.append(f"\n*({len(all_facts) - len(relevant)} other facts exist but not relevant — call recall_lore if needed)*")
     return "\n".join(lines)
