@@ -82,7 +82,7 @@ Result: sluggish UI, high token costs, poor RAG utilization, cache misses.
 
 - **Sidebar**: 
   - `_sidebar_identity` uses cached lore
-  - `_sidebar_model_chain_picker` and `_sidebar_model_settings` wrapped in `@st.fragment` for independent reruns
+  - ~~`_sidebar_model_chain_picker` and `_sidebar_model_settings` wrapped in `@st.fragment` for independent reruns~~ **REVERTED — this crashed the app.** Streamlit refuses widget creation outside a fragment's own container (`StreamlitFragmentWidgetsNotAllowedOutsideError`), and every widget in those two functions lives in `st.sidebar`, so the failure fired on the first widget (`🗑️ Clear Chat`) on a plain page load and aborted the script before the chat UI rendered. Both functions are back in the main script. Fragments are still used where they are legal: `_render_tool_status_banner`, `_flush_lore_confirmations` and `_maybe_show_name_popup` (main-body / non-sidebar renders). Enforced by `tests/test_fragment_policy.py`.
   - `_sidebar_personality_and_brain` only applies theme if personality changed
 
 - **Catalogue fetchers**: TTL increased 3600 -> 7200 (2h) to reduce API calls
@@ -155,5 +155,5 @@ assert stats["est_tokens"] < 3000
 - `lore_store.py`: persistent SQLite, private cache, search_facts, render_lore_block_rag
 - `styles.py`: CSS injection, no file I/O
 - `tools.py`: RAG-filtered recall_lore
-- `chatbot.py`: RAG prompt builder, cached temporal, static catchy phrases, cached avatar, fragment-wrapped sidebars, pre-warm, optimized chat history
+- `chatbot.py`: RAG prompt builder, cached temporal, static catchy phrases, cached avatar, pre-warm, optimized chat history, fragment guards (sidebar widgets must stay outside fragments — see the FRAGMENT POLICY note at the top of `chatbot.py`)
 - `OPTIMIZATION.md` (this file): documentation

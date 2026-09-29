@@ -296,6 +296,7 @@ shows `via 🎛️ OpenRouter · 1.4s`. No banner, no error, no "try again".
 | `System_prompt.md` | The persona spec injected as the system message — **♂️ male variant** (he/him). Includes privacy gate, Friend Mode, family, interests, online presence. |
 | `System_prompt_female.md` | **♀️ female variant** of the same persona (she/her) — the "correct gender" a new chat starts in by default. Same section structure, so the persona-mode trimming and the gender-transition event block work identically. |
 | `test_tts.py` | Standalone smoke test for the free TTS engines. |
+| `tests/test_fragment_policy.py` | Dependency-free static check (`python tests/test_fragment_policy.py`) that no `@st.fragment` can reach a sidebar widget — see the Development notes below. |
 | `sanniva_face.jpg` | Avatar shown in chat. |
 | `requirements.txt` | Pinned dependencies (Streamlit, groq, google-genai, cohere, openai, etc.). |
 | `README_ENV.md` | Extended env-var / deployment notes. |
@@ -370,6 +371,17 @@ no successful response. Check:
 2. Did all providers' models 404? Open the model-fallback expander for
    each provider and confirm the model IDs look current.
 3. Network — `curl https://api.groq.com/openai/v1/models` etc.
+
+### "redacted error" / `StreamlitFragmentWidgetsNotAllowedOutsideError` on load
+Streamlit Cloud redacts the message, but the real error is *"Fragments
+cannot write widgets to outside containers."* It means a function wrapped
+in `@st.fragment` created a widget in a container the fragment doesn't own
+— almost always `st.sidebar`. The traceback's last `chatbot.py` frame names
+the offending function (e.g. `_sidebar_model_settings` → `st.sidebar.button`).
+Fix: remove `@st.fragment` from that function and everything it calls; only
+`_render_tool_status_banner`, `_flush_lore_confirmations` and
+`_maybe_show_name_popup` may be fragments. Run
+`python tests/test_fragment_policy.py` to confirm before pushing.
 
 ### "rate_limit" / TPM errors from Groq
 Groq's default chain (`openai/gpt-oss-120b` → `openai/gpt-oss-20b` →
@@ -447,6 +459,17 @@ warning if you're expecting cloud sync.
   per-turn variability (user name, lore block, popup state, temporal
   context) to the end. This keeps Groq's automatic prefix caching
   hitting across turns within a session.
+- **`@st.fragment` may not own sidebar widgets.** A fragment can only
+  create widgets inside its own container, so anything rendering into
+  `st.sidebar` (the Clear Chat button, the creativity/timeout sliders, the
+  provider pickers) must stay in the main script. Wrapping those in a
+  fragment raises
+  `StreamlitFragmentWidgetsNotAllowedOutsideError: Fragments cannot write
+  widgets to outside containers.` on page load. The legal fragments in
+  `chatbot.py` are `_render_tool_status_banner`,
+  `_flush_lore_confirmations` and `_maybe_show_name_popup` (main-body
+  renders only). `python tests/test_fragment_policy.py` fails the build if
+  that rule is ever broken — directly or through a helper function.
 - **`.streamlit/config.toml` is rewritten on every personality switch**
   by `styles.py`. If you're versioning theme changes, be aware Streamlit
   will overwrite manual edits the next time the user changes personality.
